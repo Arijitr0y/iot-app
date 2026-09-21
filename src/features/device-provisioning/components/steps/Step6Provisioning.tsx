@@ -133,14 +133,19 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
 
         // Now call the backend to setup the provisioning claim
         const backendUrl = import.meta.env.VITE_API_URL;
-        const claimRes = await fetch(`${backendUrl}/api/devices/provision_setup`, {
-          method: 'POST',
-          headers: {
-            'Content-Type': 'application/json',
-            'Authorization': `Bearer ${session.access_token}`
-          },
-          body: JSON.stringify({ mac_address: deviceMac, session_token: sessionToken })
-        });
+        let claimRes;
+        try {
+          claimRes = await fetch(`${backendUrl}/api/devices/provision_setup`, {
+            method: 'POST',
+            headers: {
+              'Content-Type': 'application/json',
+              'Authorization': `Bearer ${session.access_token}`
+            },
+            body: JSON.stringify({ mac_address: deviceMac, session_token: sessionToken })
+          });
+        } catch (fetchErr: any) {
+          throw new Error(`Failed to contact backend (${backendUrl}): ${fetchErr.message}. This is likely a CORS error or your mobile network is blocking the domain. Try using Wi-Fi instead of cellular data.`);
+        }
 
         if (!claimRes.ok) {
           throw new Error('Failed to setup device provisioning claim. Device may not connect to cloud.');

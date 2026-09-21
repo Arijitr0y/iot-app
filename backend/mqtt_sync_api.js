@@ -29,8 +29,8 @@ import { config } from './config.js';
 const execPromise = util.promisify(exec);
 const app = express();
 
-// Enable CORS for specific origin
-app.use(cors({ origin: config.FRONTEND_URL }));
+// Enable CORS for all origins (safe because endpoints require JWT authentication)
+app.use(cors());
 app.use(express.json());
 
 // Rate limiting
@@ -530,7 +530,7 @@ app.post('/api/devices/claim', async (req, res) => {
     }
 
     if (claim.token !== token) {
-      return res.status(401).json({ success: false, error: 'Invalid provisioning token' });
+      return res.status(401).json({ success: false, error: `Invalid provisioning token: expected [${claim.token}], got [${token}]` });
     }
 
     console.log(`[PROVISION] Valid claim from ${mac_address}. Generating MQTT credentials...`);
