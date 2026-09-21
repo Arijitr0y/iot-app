@@ -10,6 +10,10 @@ import { supabase } from '@/lib/supabase';
 export const Dashboard = () => {
   const [devices, setDevices] = useState<Device[]>([]);
   const [deviceError, setDeviceError] = useState<{ id: string, message: string } | null>(null);
+  
+  // Debug state
+  const [rawDbData, setRawDbData] = useState<any>(null);
+  const [rawDbError, setRawDbError] = useState<any>(null);
 
   useEffect(() => {
     let isMounted = true;
@@ -36,6 +40,11 @@ export const Dashboard = () => {
         `)
         .eq('owner_id', session.user.id);
       
+      if (isMounted) {
+        setRawDbError(error);
+        setRawDbData(data);
+      }
+
       if (error) {
         console.error('Error fetching devices:', error);
         return;
@@ -113,6 +122,14 @@ export const Dashboard = () => {
       <WelcomeCard />
 
       <DeviceList devices={devices} />
+
+      {/* DEBUG PANEL */}
+      <div className="mt-8 p-4 bg-gray-900 text-green-400 font-mono text-xs rounded-lg overflow-auto">
+        <h3 className="text-white font-bold mb-2">DEBUG INFO (Send screenshot of this):</h3>
+        <p>Raw DB Error: {JSON.stringify(rawDbError)}</p>
+        <p>Raw DB Data Length: {rawDbData?.length}</p>
+        <p>Raw DB Data: {JSON.stringify(rawDbData)}</p>
+      </div>
     </div>
   );
 };
