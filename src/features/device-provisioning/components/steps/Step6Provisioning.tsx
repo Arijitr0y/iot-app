@@ -89,13 +89,13 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
         
         for (let attempt = 1; attempt <= 15; attempt++) {
           try {
-            const { error } = await supabase.from('user_devices').upsert({
+            const { data, error } = await supabase.from('user_devices').upsert({
               owner_id: session.user.id,
               device_type_id: deviceTypeId,
               name: `Smart Relay (${deviceMac.substring(deviceMac.length - 4)})`,
               mac_address: deviceMac,
               relay_state: false
-            }, { onConflict: 'mac_address' });
+            }, { onConflict: 'mac_address' }).select();
 
             if (error) {
               // If it's a Supabase API error (not a network error), we shouldn't retry
@@ -104,6 +104,11 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
                 break; 
               }
               throw error; // Throw so we catch and retry
+            }
+            
+            if (!data || data.length === 0) {
+              insertError = new Error('This device is already registered to another account. Please contact support or delete it from the original account.');
+              break;
             }
             
             success = true;

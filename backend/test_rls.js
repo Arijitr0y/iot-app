@@ -1,11 +1,17 @@
 import { createClient } from '@supabase/supabase-js';
 import fs from 'fs';
 import WebSocket from 'ws';
+import { fileURLToPath } from 'url';
+import { dirname, join } from 'path';
 
 // Set up WebSocket polyfill for Node.js 20
 globalThis.WebSocket = WebSocket;
 
-const envContent = fs.readFileSync('../.env', 'utf-8');
+const __filename = fileURLToPath(import.meta.url);
+const __dirname = dirname(__filename);
+const envPath = join(__dirname, '../.env');
+
+const envContent = fs.readFileSync(envPath, 'utf-8');
 let env = {};
 envContent.split('\n').forEach(line => {
   if (line && !line.startsWith('#')) {

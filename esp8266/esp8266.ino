@@ -1,3 +1,17 @@
+/*
+ * Motor Plug ESP8266 Production-Oriented Firmware
+ *
+ * Provisioning behavior:
+ *  - First boot / no saved Wi-Fi: AP starts automatically.
+ *  - Factory reset: AP starts automatically after reboot.
+ *  - 5-second button hold: manually enter provisioning mode.
+ *  - 10-second button hold: factory reset.
+ *
+ * Final commercial release still requires hardware validation, electrical
+ * safety/interlock testing, brownout/reset testing, OTA recovery testing,
+ * and live infrastructure security testing.
+ */
+
 #include <ESP8266WiFi.h>
 #include <ESP8266HTTPClient.h>
 #include <ESP8266WebServer.h>
@@ -9,6 +23,11 @@
 #include "certs.h"
 
 X509List certList;
+
+// Forward declarations for globals used by functions defined before the
+// concrete global-object definitions later in this file.
+extern bool relayState;
+extern PubSubClient mqttClient;
 
 #define FIRMWARE_VERSION "1.0.0"
 
@@ -151,6 +170,11 @@ bool loadMqttCredentials(String &user, String &password) {
 
 void factoryReset() {
   Serial.println("Starting Factory Reset...");
+
+  // Safety: ensure pump relay is OFF before erasing configuration/restarting.
+  // Use the hardware pin directly here because this function is declared
+  // before the later global relay/MQTT objects. The ESP will restart after reset.
+  digitalWrite(2, HIGH); // GPIO2 / D4, active-LOW relay OFF
   
   // 1. Erase EEPROM
   EEPROM.begin(512);
@@ -217,6 +241,15 @@ bool pendingWifiConfig = false;
 String pendingSsid = "";
 String pendingPass = "";
 unsigned long pendingWifiConfigTime = 0;
+unsigned long wifiConnectStartTime = 0;
+unsigned long wifiSuccessTime = 0;
+const unsigned long WIFI_CONNECT_TIMEOUT_MS = 30000UL;
+
+// Boot-time Wi-Fi connection state.
+// True only when valid Wi-Fi credentials were loaded from EEPROM.
+bool bootWifiAttemptActive = false;
+unsigned long bootWifiAttemptStart = 0;
+const unsigned long AP_GRACE_AFTER_WIFI_MS = 8000UL;
 
 // Provisioning Security State
 enum ProvisioningState {
@@ -226,7 +259,10 @@ enum ProvisioningState {
   STATE_CONFIGURING,
   STATE_CONNECTING_WIFI,
   STATE_PROVISIONING_SUCCESS,
-  STATE_PROVISION_FAILED
+  STATE_PROVISION_FAILED,
+  STATE_NTP_SYNCING,
+  STATE_CLOUD_CLAIMING,
+  STATE_MQTT_CONNECTING
 };
 
 ProvisioningState provState = STATE_NORMAL;
@@ -262,7 +298,15 @@ void handleOptions() {
 }
 
 void startProvisioningMode() {
-  if (provState != STATE_NORMAL) return;
+  if (provState != STATE_NORMAL && provState != STATE_PROVISIONING_STARTING) return;
+
+  bootWifiAttemptActive = false; // Cancel any boot Wi-Fi timers to prevent duplicate connections
+
+  // Safety: never leave the pump running while the device is in provisioning mode.
+  relayState = false;
+  digitalWrite(RELAY_PIN, HIGH);
+  if (mqttClient.connected()) mqttClient.disconnect();
+
   Serial.println("Starting Secure Provisioning Hotspot...");
   WiFi.mode(WIFI_AP_STA);
   WiFi.softAP(ap_ssid.c_str(), AP_PASS);
@@ -281,6 +325,45 @@ void handleRoot() {
   server.send(200, "application/json", json);
 }
 
+// Handle GET /status
+// Used by the web app to observe the local provisioning state without relying
+// on browser navigator.onLine (which describes the phone, not the ESP).
+void handleStatus() {
+  sendCORSHeaders();
+
+  String state = "normal";
+  switch (provState) {
+    case STATE_PROVISIONING_STARTING: state = "provisioning_starting"; break;
+    case STATE_PROVISIONING_ACTIVE: state = "provisioning_active"; break;
+    case STATE_CONFIGURING: state = "configuring"; break;
+    case STATE_CONNECTING_WIFI: state = "wifi_connecting"; break;
+    case STATE_PROVISIONING_SUCCESS: state = "wifi_connected"; break;
+    case STATE_PROVISION_FAILED: state = "wifi_failed"; break;
+    case STATE_NTP_SYNCING: state = "ntp_syncing"; break;
+    case STATE_CLOUD_CLAIMING: state = "cloud_claiming"; break;
+    case STATE_MQTT_CONNECTING: state = "mqtt_connecting"; break;
+    default: state = "normal"; break;
+  }
+
+  JsonDocument doc;
+  doc["success"] = true;
+  doc["mac"] = device_mac_str;
+  doc["state"] = state;
+  doc["wifi_connected"] = (WiFi.status() == WL_CONNECTED);
+  doc["mqtt_connected"] = mqttClient.connected();
+  if (WiFi.status() == WL_CONNECTED) {
+    doc["ip"] = WiFi.localIP().toString();
+  }
+
+  String response;
+  serializeJson(doc, response);
+  server.send(200, "application/json", response);
+}
+
+// Handle GET /status
+// Used by the provisioning web app to determine the real ESP state.
+
+
 // Handle POST /start_session
 void handleStartSession() {
   sendCORSHeaders();
@@ -295,6 +378,11 @@ void handleStartSession() {
   char tokenBuf[16];
   snprintf(tokenBuf, sizeof(tokenBuf), "%08x", raw_random);
   provisioningToken = String(tokenBuf);
+  wifiConnectStartTime = 0;
+  wifiSuccessTime = 0;
+  pendingWifiConfig = false;
+  pendingSsid = "";
+  pendingPass = "";
   
   provState = STATE_CONFIGURING;
   
@@ -393,6 +481,10 @@ bool isDuplicateCommand(const char* cmd_id) {
 
 // MQTT Callback when a message arrives
 void mqttCallback(char* topic, byte* payload, unsigned int length) {
+  if (length > 1024) {
+    Serial.println("MQTT payload rejected: too large.");
+    return;
+  }
   Serial.print("Message arrived [");
   Serial.print(topic);
   Serial.print("] ");
@@ -707,7 +799,7 @@ void handleConfigure() {
     return;
   }
   
-  if (provState != STATE_CONFIGURING) {
+  if (provState != STATE_CONFIGURING && provState != STATE_PROVISION_FAILED) {
     server.send(401, "application/json", "{\"success\": false, \"message\": \"Provisioning session not claimed or expired\"}");
     return;
   }
@@ -722,6 +814,11 @@ void handleConfigure() {
   const char* ssid = doc["ssid"];
   const char* password = doc["password"];
   const char* burl = doc["backend_url"];
+  if (!ssid || !password || String(ssid).length() == 0 || String(ssid).length() > 32 ||
+      String(password).length() > 64) {
+    server.send(400, "application/json", "{\"success\": false, \"message\": \"Invalid Wi-Fi credentials\"}");
+    return;
+  }
   if (burl) backend_url = String(burl);
   
   
@@ -791,27 +888,52 @@ void setup() {
   loadSchedules();
   
   String savedSsid, savedPassword;
+
+  // BOOT DECISION:
+  // Saved Wi-Fi credentials -> try that Wi-Fi.
+  // No saved Wi-Fi credentials -> start provisioning AP immediately.
   if (loadWifiCredentials(savedSsid, savedPassword)) {
-    loadMqttCredentials(mqtt_user, mqtt_password);
-    Serial.println("Loaded Wi-Fi credentials from EEPROM.");
+    bool haveMqttCredentials = loadMqttCredentials(mqtt_user, mqtt_password);
+
+    Serial.println("Saved Wi-Fi credentials found.");
     Serial.print("Attempting to connect to: ");
     Serial.println(savedSsid);
-    WiFi.mode(WIFI_STA); // AP is OFF by default if configured
-    WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
-  } else {
-    Serial.println("No saved Wi-Fi credentials found in EEPROM. Waiting for physical button press to enter Provisioning Mode...");
+
     WiFi.mode(WIFI_STA);
+    WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+
+    bootWifiAttemptActive = true;
+    bootWifiAttemptStart = millis();
+
+    if (!haveMqttCredentials) {
+      Serial.println("MQTT credentials missing. Starting provisioning AP...");
+      provState = STATE_PROVISIONING_STARTING;
+      startProvisioningMode();
+    } else {
+      provState = STATE_NORMAL;
+    }
+  } else {
+    // TRUE FIRST BOOT / FACTORY RESET.
+    // There is no saved Wi-Fi, therefore there is nothing to reconnect to.
+    Serial.println("No saved Wi-Fi credentials found.");
+    Serial.println("Starting provisioning AP automatically...");
+    provState = STATE_PROVISIONING_STARTING;
+    startProvisioningMode();
   }
   
   // 3. Set up HTTP routing
   server.on("/", HTTP_GET, handleRoot);
   server.on("/", HTTP_OPTIONS, handleOptions);
   server.on("/start_session", HTTP_POST, handleStartSession);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
   server.on("/start_session", HTTP_OPTIONS, handleOptions);
   server.on("/scan", HTTP_GET, handleScan);
   server.on("/scan", HTTP_OPTIONS, handleOptions);
   server.on("/configure", HTTP_POST, handleConfigure);
-  server.on("/configure", HTTP_OPTIONS, handleOptions); 
+  server.on("/configure", HTTP_OPTIONS, handleOptions);
+  server.on("/status", HTTP_GET, handleStatus);
+  server.on("/status", HTTP_OPTIONS, handleOptions);
   
   server.onNotFound([]() {
     if (server.method() == HTTP_OPTIONS) {
@@ -829,7 +951,6 @@ void setup() {
   
   // 5. Set up MQTT with TLS Certificate Validation
   certList.append(ISRG_Root_X1);
-  certList.append(GTS_Root_R1);
   espClient.setTrustAnchors(&certList);
   
   mqttClient.setServer(mqtt_server, mqtt_port);
@@ -843,50 +964,164 @@ void loop() {
   
   static bool bootConnectChecked = false;
   static unsigned long lastWifiRetry = 0;
-  if (WiFi.status() != WL_CONNECTED) {
-    if (millis() - lastWifiRetry > 30000) {
-      Serial.println("WiFi connection lost. Reconnecting...");
+
+  // BOOT-TIME WI-FI:
+  // This runs only when credentials were actually loaded from EEPROM.
+  // First boot/factory reset has bootWifiAttemptActive == false.
+  if (bootWifiAttemptActive) {
+    if (WiFi.status() == WL_CONNECTED) {
+      Serial.println("Saved Wi-Fi connected successfully.");
+      Serial.print("Local IP: ");
+      Serial.println(WiFi.localIP());
+
+      bootWifiAttemptActive = false;
+      bootConnectChecked = true;
+    } else if (millis() - bootWifiAttemptStart >= WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("Saved Wi-Fi connection timed out.");
+      Serial.println("Starting provisioning AP because saved Wi-Fi is unavailable.");
+
+      bootWifiAttemptActive = false;
+      WiFi.disconnect(false);
+
+      provState = STATE_PROVISIONING_STARTING;
+      startProvisioningMode();
+    }
+  }
+
+  // NORMAL MODE WI-FI RECOVERY:
+  // Never run reconnect while provisioning AP mode is active.
+  if (provState == STATE_NORMAL &&
+      !bootWifiAttemptActive &&
+      WiFi.status() != WL_CONNECTED) {
+
+    if (millis() - lastWifiRetry > 30000UL) {
+      Serial.println("Wi-Fi connection lost. Reconnecting saved Wi-Fi...");
       WiFi.reconnect();
       lastWifiRetry = millis();
     }
   }
 
-
-
-  // --- Secure MQTT Credential Provisioning ---
-  if (WiFi.status() == WL_CONNECTED && mqtt_user == "" && backend_url != "" && provState != STATE_NORMAL) {
-    if (millis() - lastClaimPoll > 5000) {
+  // --- Secure MQTT Credential Provisioning State Machine ---
+  if (WiFi.status() == WL_CONNECTED && mqtt_user == "" && backend_url != "") {
+    
+    if (provState == STATE_PROVISIONING_SUCCESS) {
+      Serial.println("Starting NTP synchronization...");
+      initNTP();
+      provState = STATE_NTP_SYNCING;
       lastClaimPoll = millis();
-      Serial.println("Polling backend for MQTT credentials...");
-      
-      HTTPClient http;
-      WiFiClientSecure client;
-      client.setTrustAnchors(&certList); // Validate server certificate
-      
-      http.begin(client, backend_url + "/api/devices/claim");
-      http.addHeader("Content-Type", "application/json");
-      
-      String payload = "{\"mac_address\":\"" + device_mac_str + "\", \"token\":\"" + provisioningToken + "\"}";
-      int httpCode = http.POST(payload);
-      
-      if (httpCode == 200) {
-        String resp = http.getString();
-        JsonDocument doc;
-        deserializeJson(doc, resp);
+    } 
+    else if (provState == STATE_NTP_SYNCING) {
+      if (millis() - lastClaimPoll > 1000) {
+        lastClaimPoll = millis();
+        time_t now = time(nullptr);
+        if (now > 100000) {
+          Serial.println("\nNTP synchronized.");
+          Serial.println("Starting cloud claim...");
+          provState = STATE_CLOUD_CLAIMING;
+          lastClaimPoll = 0; // force immediate claim
+        }
+      }
+    }
+    else if (provState == STATE_CLOUD_CLAIMING) {
+      if (millis() - lastClaimPoll > 5000) {
+        lastClaimPoll = millis();
         
-        if (doc["success"]) {
-          mqtt_user = doc["mqtt_username"].as<String>();
-          mqtt_password = doc["mqtt_password"].as<String>();
-          saveMqttCredentials(mqtt_user, mqtt_password);
-          Serial.println("✅ Successfully claimed secure MQTT credentials!");
+        String claimUrl = backend_url;
+        if (claimUrl.endsWith("/")) {
+            claimUrl = claimUrl.substring(0, claimUrl.length() - 1);
+        }
+        claimUrl += "/api/devices/claim";
+        
+        Serial.println("\nConnecting to:");
+        Serial.println(claimUrl);
+        
+        HTTPClient http;
+        WiFiClientSecure client;
+        client.setTrustAnchors(&certList);
+        client.setTimeout(10);
+        
+        // Print diagnostic TLS result as requested
+        String backendHost = claimUrl.substring(claimUrl.indexOf("://") + 3);
+        int slashPos = backendHost.indexOf('/');
+        if (slashPos > 0) backendHost = backendHost.substring(0, slashPos);
+        int colonPos = backendHost.indexOf(':');
+        if (colonPos > 0) backendHost = backendHost.substring(0, colonPos);
+        
+        IPAddress resolvedIP;
+        if (WiFi.hostByName(backendHost.c_str(), resolvedIP)) {
+          bool tlsConnected = client.connect(resolvedIP, 443);
+          Serial.print("\nTLS result: ");
+          Serial.println(tlsConnected ? "CONNECTED" : "FAILED");
+          if (tlsConnected) {
+            Serial.println("TLS handshake successful.");
+            client.stop(); // close diagnostic connection
+          }
+        }
+        
+        http.begin(client, claimUrl);
+        http.addHeader("Content-Type", "application/json");
+        
+        String payload = "{\"mac_address\":\"" + device_mac_str + "\", \"token\":\"" + provisioningToken + "\"}";
+        int httpCode = http.POST(payload);
+        
+        if (httpCode > 0) {
+          Serial.print("\nClaim HTTP code: ");
+          Serial.println(httpCode);
           
-          // Clear sensitive token
-          provisioningToken = "";
+          String resp = http.getString();
+          if (httpCode != 200) {
+            Serial.print("Response body: ");
+            Serial.println(resp);
+          }
+          
+          if (httpCode == 200) {
+            JsonDocument doc;
+            deserializeJson(doc, resp);
+            
+            if (doc["success"]) {
+              mqtt_user = doc["mqtt_username"].as<String>();
+              mqtt_password = doc["mqtt_password"].as<String>();
+              saveMqttCredentials(mqtt_user, mqtt_password);
+              Serial.println("\nMQTT credentials received.");
+              
+              provisioningToken = "";
+              provState = STATE_MQTT_CONNECTING;
+              lastReconnectAttempt = 0;
+            }
+          }
+        } else {
+          Serial.printf("\nClaim failed with code: %d\n", httpCode);
+          char tlsError[256] = {0};
+          client.getLastSSLError(tlsError, sizeof(tlsError));
+          if (strlen(tlsError) > 0) {
+            Serial.print("TLS error: ");
+            Serial.println(tlsError);
+          }
+        }
+        http.end();
+      }
+    }
+    else if (provState == STATE_MQTT_CONNECTING) {
+      if (!mqttClient.connected()) {
+        if (millis() - lastReconnectAttempt > 5000) {
+          lastReconnectAttempt = millis();
+          Serial.println("\nConnecting MQTT...");
+          if (reconnectMQTT()) {
+            Serial.println("\nMQTT connected.");
+            Serial.println("\nDevice provisioning complete.");
+            Serial.println("Entering NORMAL mode.");
+            Serial.println("\nDisabling provisioning AP.");
+            
+            provState = STATE_NORMAL;
+            WiFi.softAPdisconnect(true);
+            WiFi.mode(WIFI_STA);
+          }
         }
       } else {
-        Serial.printf("Claim failed with code: %d\n", httpCode);
+         provState = STATE_NORMAL;
+         WiFi.softAPdisconnect(true);
+         WiFi.mode(WIFI_STA);
       }
-      http.end();
     }
   }
 
@@ -922,11 +1157,13 @@ void loop() {
       bool levelChanged = (newLevel != currentWaterLevel);
       currentWaterLevel = newLevel;
 
-      // Automatic Motor Control
-      if (currentWaterLevel == 100 && relayState == true) {
+      // Automatic Motor Control is only allowed during normal operation.
+      if (provState == STATE_NORMAL && mqttClient.connected() &&
+          currentWaterLevel == 100 && relayState == true) {
         Serial.println("Water HIGH: Auto stopping motor.");
         setRelayState(false);
-      } else if (currentWaterLevel == 0 && relayState == false) {
+      } else if (provState == STATE_NORMAL && mqttClient.connected() &&
+                 currentWaterLevel == 0 && relayState == false) {
         Serial.println("Water LOW: Auto starting motor.");
         setRelayState(true);
       }
@@ -962,7 +1199,7 @@ void loop() {
   static unsigned long lastScheduleCheck = 0;
   static int lastTriggeredMinute = -1; 
   
-  if (millis() - lastScheduleCheck > 1000) {
+  if (provState == STATE_NORMAL && millis() - lastScheduleCheck > 1000) {
     lastScheduleCheck = millis();
     
     time_t now = time(nullptr);
@@ -998,60 +1235,72 @@ void loop() {
     }
   }
 
-  // --- Handle Pending Config ---
-  if (pendingWifiConfig && millis() - pendingWifiConfigTime > 1500) {
+  // --- Handle Pending Wi-Fi Configuration ---
+  // Start the connection asynchronously. Do NOT block the HTTP server while
+  // waiting for Wi-Fi; the web app needs /status to observe the transition.
+  if (pendingWifiConfig && millis() - pendingWifiConfigTime >= 250) {
     pendingWifiConfig = false;
-    Serial.println("Attempting to connect to Wi-Fi from pending config...");
+    wifiConnectStartTime = millis();
+    provState = STATE_CONNECTING_WIFI;
+
+    Serial.println("Attempting to connect to Wi-Fi from provisioning config...");
+    Serial.print("Target SSID: ");
+    Serial.println(pendingSsid);
+
+    // Keep AP+STA alive during the connection attempt so the phone can poll
+    // /status and receive a definitive result.
+    WiFi.mode(WIFI_AP_STA);
+    WiFi.disconnect(false);
+    delay(50);
     WiFi.begin(pendingSsid.c_str(), pendingPass.c_str());
-    
-    int attempts = 0;
-    while (WiFi.status() != WL_CONNECTED && attempts < 30) {
-      delay(500);
-      Serial.print(".");
-      attempts++;
-    }
-    
+  }
+
+  // --- Non-blocking Wi-Fi connection result ---
+  if (provState == STATE_CONNECTING_WIFI) {
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("\n✅ Successfully connected to Wi-Fi!");
+      Serial.println("\nWi-Fi connected successfully.");
+      Serial.print("Local IP: ");
+      Serial.println(WiFi.localIP());
+
+      // Only persist credentials after actual WL_CONNECTED.
       saveWifiCredentials(pendingSsid, pendingPass);
+
       provState = STATE_PROVISIONING_SUCCESS;
-      provisioningToken = "";
-      shouldDisableAP = true;
-      disableAPTime = millis();
-    } else {
-      Serial.println("\n❌ Failed to connect to Wi-Fi. AP will remain active.");
-      provState = STATE_CONFIGURING; // revert back to configuring to allow retry
+      wifiSuccessTime = millis();
+      lastClaimPoll = 0;
+
+      // IMPORTANT: keep provisioningToken until the backend claim succeeds.
+      // The backend uses this token to issue the device's unique MQTT creds.
+      Serial.println("Wi-Fi credentials committed. Waiting for cloud/MQTT claim...");
+    } else if (millis() - wifiConnectStartTime >= WIFI_CONNECT_TIMEOUT_MS) {
+      Serial.println("\nWi-Fi connection timed out. Credentials were NOT saved.");
+      WiFi.disconnect(false);
+      provState = STATE_PROVISION_FAILED;
     }
-    
-    pendingSsid = "";
-    pendingPass = "";
   }
-  
-  if (shouldDisableAP && millis() - disableAPTime > 2000) {
-    Serial.println("Disabling AP mode to allow client to reconnect to home internet...");
-    WiFi.softAPdisconnect(true);
-    WiFi.mode(WIFI_STA);
-    shouldDisableAP = false;
-    provState = STATE_NORMAL;
-    bootConnectChecked = true; // Mark as checked so we don't do it again below
-  }
-  
-  if (provState != STATE_NORMAL && millis() - provisioningStartTime > 300000) { // 5 mins timeout
-    Serial.println("Provisioning mode timed out (5 mins). Disabling AP.");
+
+  // AP shutdown logic removed - it is now handled cleanly when transitioning to STATE_NORMAL after MQTT connect.
+
+  if ((provState == STATE_PROVISIONING_ACTIVE ||
+       provState == STATE_CONFIGURING ||
+       provState == STATE_CONNECTING_WIFI ||
+       provState == STATE_PROVISION_FAILED) &&
+      millis() - provisioningStartTime > 600000UL) { // 10 mins timeout
+    Serial.println("Provisioning mode timed out (10 mins). Disabling AP.");
     provState = STATE_NORMAL;
     provisioningToken = "";
+    pendingWifiConfig = false;
+    pendingSsid = "";
+    pendingPass = "";
     WiFi.softAPdisconnect(true);
     WiFi.mode(WIFI_STA);
   }
   
   if (WiFi.status() == WL_CONNECTED) {
-    if (!bootConnectChecked) {
-      Serial.println("\n✅ Successfully auto-connected to saved Wi-Fi on boot!");
+    if (!bootConnectChecked && provState == STATE_NORMAL) {
+      Serial.println("\nSuccessfully connected to saved Wi-Fi on boot.");
       Serial.print("Local IP: ");
       Serial.println(WiFi.localIP());
-      Serial.println("Disabling AP mode...");
-      WiFi.softAPdisconnect(true);
-      WiFi.mode(WIFI_STA);
       bootConnectChecked = true;
     }
     
@@ -1059,7 +1308,7 @@ void loop() {
       unsigned long now = millis();
       if (now - lastReconnectAttempt > 5000) {
         lastReconnectAttempt = now;
-        // Attempt to reconnect
+        // Attempt to reconnec
         if (reconnectMQTT()) {
           lastReconnectAttempt = 0;
         }

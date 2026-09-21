@@ -533,8 +533,6 @@ app.post('/api/devices/claim', async (req, res) => {
       return res.status(401).json({ success: false, error: 'Invalid provisioning token' });
     }
 
-    // Claim valid! Remove from pending
-    pendingProvisioningClaims.delete(mac_address);
     console.log(`[PROVISION] Valid claim from ${mac_address}. Generating MQTT credentials...`);
 
     // 1. Generate credentials
@@ -624,7 +622,7 @@ app.post('/api/devices/claim', async (req, res) => {
         }
       }
       
-      await fs.promises.writeFile(ACL_FILE_PATH, aclContent);
+      await fs.writeFile(ACL_FILE_PATH, aclContent);
       await execPromise(`docker exec ${config.MOSQUITTO_CONTAINER_NAME} kill -SIGHUP 1`);
       
     } catch (syncErr) {
@@ -639,11 +637,14 @@ app.post('/api/devices/claim', async (req, res) => {
       mqtt_username: username,
       mqtt_password: password
     });
+    
+    // Cleanup pending claim ONLY after fully successful operation
+    pendingProvisioningClaims.delete(mac_address);
     console.log(`[PROVISION] Successfully provisioned MQTT credentials for ${mac_address}`);
 
   } catch (err) {
     console.error('Claim endpoint error:', err);
-    res.status(500).json({ success: false, error: 'Internal server error' });
+    res.status(500).json({ success: false, error: err.message || 'Internal server error' });
   }
 });
 
