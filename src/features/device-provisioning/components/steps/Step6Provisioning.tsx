@@ -148,7 +148,9 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
         }
 
         if (!claimRes.ok) {
-          throw new Error('Failed to setup device provisioning claim. Device may not connect to cloud.');
+          let errText = 'Unknown error';
+          try { errText = await claimRes.text(); } catch(e) {}
+          throw new Error(`Failed to setup device provisioning claim. Server says: ${claimRes.status} ${errText}`);
         }
         
         if (!isMounted) return;

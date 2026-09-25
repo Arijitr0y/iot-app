@@ -75,12 +75,28 @@ const commandIpLimiter = rateLimit({
 
 const commandDeviceLimiter = rateLimit({
   windowMs: 60 * 1000,
-  max: 10,
+  max: 120, // Increased from 10 to allow rapid testing/toggling
   keyGenerator: (req) => req.params.deviceId || 'unknown',
   message: { success: false, error: 'Too many commands sent to this device' }
 });
 
 const ALLOWED_COMMANDS = ['on', 'off', 'restart', 'factory_reset', 'restart_mqtt', 'restart_wifi', 'sync_time', 'sync_config', 'relay_test', 'sensor_test', 'led_blink', 'enable_debug', 'disable_debug', 'enter_recovery'];
+
+// --- Ultra-Fast Auth Caching ---
+// To achieve 10-50ms command latency, we cache Supabase lookups for 30 seconds.
+const authCache = new Map(); // token -> { user, expiresAt }
+const deviceAuthCache = new Map(); // token+deviceId -> { device, expiresAt }
+
+// Garbage collection for caches to prevent memory leaks in production (Scalability fix)
+setInterval(() => {
+  const now = Date.now();
+  for (const [key, value] of authCache.entries()) {
+    if (value.expiresAt <= now) authCache.delete(key);
+  }
+  for (const [key, value] of deviceAuthCache.entries()) {
+    if (value.expiresAt <= now) deviceAuthCache.delete(key);
+  }
+}, 60000); // Run cleanup every 60 seconds
 
 // Helper to authenticate user from Bearer token
 async function authenticateUser(req, res) {
@@ -90,16 +106,36 @@ async function authenticateUser(req, res) {
     return null;
   }
   const token = authHeader.split(' ')[1];
+  
+  // Check fast cache
+  const cached = authCache.get(token);
+  if (cached && cached.expiresAt > Date.now()) {
+    return cached.user;
+  }
+
   const { data: { user }, error: authError } = await supabase.auth.getUser(token);
   if (authError || !user) {
     res.status(401).json({ success: false, error: 'Unauthorized: Invalid token' });
     return null;
   }
+  
+  // Cache for 30 seconds
+  authCache.set(token, { user, expiresAt: Date.now() + 30000 });
   return user;
 }
 
 // Helper to check device ownership or admin permission
 async function authorizeDeviceAccess(user, deviceId, res) {
+  const cacheKey = `${user.id}_${deviceId}`;
+  const cached = deviceAuthCache.get(cacheKey);
+  if (cached && cached.expiresAt > Date.now()) {
+    if (cached.device === null) {
+      res.status(403).json({ success: false, error: 'Forbidden: Access denied' });
+      return null;
+    }
+    return cached.device;
+  }
+
   const { data: device, error } = await supabase
     .from('user_devices')
     .select('*')
@@ -107,11 +143,13 @@ async function authorizeDeviceAccess(user, deviceId, res) {
     .single();
 
   if (error || !device) {
+    deviceAuthCache.set(cacheKey, { device: null, expiresAt: Date.now() + 30000 });
     res.status(404).json({ success: false, error: 'Device not found or access denied' });
     return null;
   }
 
   if (device.owner_id === user.id) {
+    deviceAuthCache.set(cacheKey, { device, expiresAt: Date.now() + 30000 });
     return device; // User owns the device
   }
 
@@ -130,11 +168,13 @@ async function authorizeDeviceAccess(user, deviceId, res) {
       .single();
       
     if (roleDef && roleDef.manage_inventory) {
+      deviceAuthCache.set(cacheKey, { device, expiresAt: Date.now() + 30000 });
       return device; // Admin with inventory access
     }
   }
 
   // Not owner, not admin
+  deviceAuthCache.set(cacheKey, { device: null, expiresAt: Date.now() + 30000 });
   res.status(403).json({ success: false, error: 'Forbidden: Access denied to this device' });
   return null;
 }

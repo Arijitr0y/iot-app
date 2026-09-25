@@ -39,7 +39,7 @@ const int EEPROM_MQTT_USER_ADDR = 130;
 const int EEPROM_MQTT_PASS_ADDR = 165;
 const byte EEPROM_MAGIC_BYTE = 0xAA;
 
-const int EEPROM_SCHEDULES_ADDR = 100;
+const int EEPROM_SCHEDULES_ADDR = 200; // Moved to 200 to prevent overlap with MQTT passwords
 const int MAX_SCHEDULES = 5;
 
 struct Schedule {
@@ -108,7 +108,12 @@ void saveWifiCredentials(String ssid, String password) {
 }
 
 bool loadWifiCredentials(String &ssid, String &password) {
-  if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_BYTE) {
+  byte magic = EEPROM.read(EEPROM_MAGIC_ADDR);
+  Serial.print("\n[BOOT] Reading EEPROM Magic Byte: 0x");
+  Serial.println(magic, HEX);
+  
+  if (magic != EEPROM_MAGIC_BYTE) {
+    Serial.println("[BOOT] EEPROM magic byte mismatch or empty. Returning false.");
     return false; // No saved credentials
   }
   
@@ -125,6 +130,12 @@ bool loadWifiCredentials(String &ssid, String &password) {
     if (c == 0) break;
     password += c;
   }
+  
+  Serial.print("[BOOT] Loaded SSID from memory: '");
+  Serial.print(ssid);
+  Serial.println("'");
+  Serial.print("[BOOT] Password length loaded: ");
+  Serial.println(password.length());
   
   return ssid.length() > 0;
 }
@@ -214,11 +225,10 @@ String mqtt_password = "";
 String backend_url = "";
 unsigned long lastClaimPoll = 0;
 
-// --- Hardware Pins ---
-// GPIO2 is the onboard LED on most ESP8266 boards (NodeMCU, Wemos D1 Mini).
-// Note: It is usually active LOW (LOW = ON, HIGH = OFF)
+// Hardware Pins
 const int RELAY_PIN = 2; // GPIO2 / D4
 const int BUTTON_PIN = 0; // GPIO0 / D3
+const int WIFI_LED_PIN = 15; // D8 (GPIO15) - Glows when Wi-Fi is connected
 
 // Water Tank Sensor Pins
 // Note: Since we are using internal pull-ups (INPUT_PULLUP), the Common wire MUST be connected to GND, not 3V3.
@@ -235,6 +245,10 @@ unsigned long lastWaterCheck = 0;
 unsigned long lastReconnectAttempt = 0;
 bool shouldDisableAP = false;
 unsigned long disableAPTime = 0;
+
+// Debouncing for MQTT
+bool pendingStatePublish = false;
+unsigned long lastStatePublish = 0;
 
 // Pending Wi-Fi configuration from Web App
 bool pendingWifiConfig = false;
@@ -420,26 +434,36 @@ void handleScan() {
 // Publish the current state to MQTT
 void publishState() {
   if (!mqttClient.connected()) return;
-  String topic = "iot/devices/" + device_mac_str + "/state";
+
   JsonDocument doc;
   doc["id"] = device_mac_str;
   doc["status"] = "online";
   doc["state"] = relayState ? "on" : "off";
   doc["water_level"] = currentWaterLevel;
-  
+
   char buffer[256];
   serializeJson(doc, buffer);
-  mqttClient.publish(topic.c_str(), buffer, true); // Retained message
-  Serial.print("Published state: ");
+  
+  String topic = "iot/devices/" + device_mac_str + "/state";
+  bool success = mqttClient.publish(topic.c_str(), buffer, true); // Retained message
+  
+  Serial.println("\n--- MQTT PUBLISH ---");
+  Serial.print("Topic: ");
+  Serial.println(topic);
+  Serial.print("Payload: ");
   Serial.println(buffer);
+  Serial.print("Success: ");
+  Serial.println(success ? "YES" : "NO");
+  Serial.println("--------------------\n");
 }
 
 // Toggle Relay and publish state
 void setRelayState(bool state) {
   relayState = state;
-  // GPIO2 is active LOW on ESP8266
+  // GPIO2/LED_BUILTIN are usually active LOW on ESP8266
   digitalWrite(RELAY_PIN, relayState ? LOW : HIGH);
-  publishState();
+  digitalWrite(LED_BUILTIN, relayState ? LOW : HIGH);
+  pendingStatePublish = true; // Defer publishing to the main loop to prevent buffer overflow
 }
 
 // Send Command Acknowledgment back to backend
@@ -845,11 +869,23 @@ void handleConfigure() {
 
 void setup() {
   Serial.begin(115200);
-  delay(1000);
+  delay(100);
   
-  // Setup Hardware Pins
+  // MUST initialize EEPROM before reading saved credentials!
+  EEPROM.begin(512);
+  
+  Serial.println("\n\n=== ESP8266 PROVISIONING SERVER ===");
+
   pinMode(RELAY_PIN, OUTPUT);
+  digitalWrite(RELAY_PIN, HIGH); // Relay OFF
+
+  pinMode(LED_BUILTIN, OUTPUT);
+  digitalWrite(LED_BUILTIN, HIGH); // Onboard LED OFF
+
   pinMode(BUTTON_PIN, INPUT_PULLUP);
+  
+  pinMode(WIFI_LED_PIN, OUTPUT);
+  digitalWrite(WIFI_LED_PIN, LOW); // LED OFF initially
   
   // Configure water sensor pins as input with internal pull-ups
   // Since ESP8266 only has pull-ups, the common wire must be GND!
@@ -895,12 +931,19 @@ void setup() {
   if (loadWifiCredentials(savedSsid, savedPassword)) {
     bool haveMqttCredentials = loadMqttCredentials(mqtt_user, mqtt_password);
 
-    Serial.println("Saved Wi-Fi credentials found.");
-    Serial.print("Attempting to connect to: ");
+    Serial.println("[BOOT] Saved Wi-Fi credentials found.");
+    Serial.print("[BOOT] Attempting to connect to: ");
     Serial.println(savedSsid);
 
+    Serial.println("[BOOT] Setting WiFi mode to STA...");
     WiFi.mode(WIFI_STA);
+    WiFi.disconnect(); // Clear any stuck internal RF state from previous power cycle
+    delay(100);
+    WiFi.setAutoReconnect(true); // Force hardware-level auto-reconnect
+    
+    Serial.println("[BOOT] Calling WiFi.begin()...");
     WiFi.begin(savedSsid.c_str(), savedPassword.c_str());
+    Serial.println("[BOOT] WiFi.begin() executed.");
 
     bootWifiAttemptActive = true;
     bootWifiAttemptStart = millis();
@@ -953,6 +996,11 @@ void setup() {
   certList.append(ISRG_Root_X1);
   espClient.setTrustAnchors(&certList);
   
+  // CRITICAL LATENCY FIX: Disable Nagle's Algorithm.
+  // This prevents the ESP8266 from buffering small MQTT packets (like ACKs) 
+  // over TLS, which can artificially delay them by 200-500ms.
+  espClient.setNoDelay(true); 
+  
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);
   
@@ -962,6 +1010,27 @@ void setup() {
 void loop() {
   server.handleClient();
   
+  // Update Wi-Fi LED on D8
+  if (WiFi.status() == WL_CONNECTED) {
+    digitalWrite(WIFI_LED_PIN, HIGH); // Glow when connected
+  } else {
+    digitalWrite(WIFI_LED_PIN, LOW);  // Off when disconnected
+  }
+
+  // Debounced MQTT State Publish
+  if (pendingStatePublish && (millis() - lastStatePublish > 250)) {
+    pendingStatePublish = false;
+    lastStatePublish = millis();
+    publishState();
+  }
+
+  // AP Disable Logic
+  if (shouldDisableAP && millis() > disableAPTime) {
+    shouldDisableAP = false;
+    WiFi.softAPdisconnect(true);
+    Serial.println("Disabled Provisioning Hotspot to force phone internet recovery.");
+  }
+
   static bool bootConnectChecked = false;
   static unsigned long lastWifiRetry = 0;
 
@@ -969,8 +1038,17 @@ void loop() {
   // This runs only when credentials were actually loaded from EEPROM.
   // First boot/factory reset has bootWifiAttemptActive == false.
   if (bootWifiAttemptActive) {
+    
+    // Debug print every 1 second
+    static unsigned long lastWifiStatusPrint = 0;
+    if (millis() - lastWifiStatusPrint > 1000) {
+      Serial.print("[WIFI-BOOT] Status code: ");
+      Serial.println(WiFi.status());
+      lastWifiStatusPrint = millis();
+    }
+
     if (WiFi.status() == WL_CONNECTED) {
-      Serial.println("Saved Wi-Fi connected successfully.");
+      Serial.println("\n[WIFI-BOOT] Saved Wi-Fi connected successfully.");
       Serial.print("Local IP: ");
       Serial.println(WiFi.localIP());
 
@@ -1009,6 +1087,11 @@ void loop() {
       initNTP();
       provState = STATE_NTP_SYNCING;
       lastClaimPoll = millis();
+      
+      // Schedule AP disable in 5 seconds to force phone to drop connection
+      // and use cellular data for the final API claim step.
+      shouldDisableAP = true;
+      disableAPTime = millis() + 5000;
     } 
     else if (provState == STATE_NTP_SYNCING) {
       if (millis() - lastClaimPoll > 1000) {
@@ -1038,25 +1121,8 @@ void loop() {
         HTTPClient http;
         WiFiClientSecure client;
         client.setTrustAnchors(&certList);
-        client.setTimeout(10);
-        
-        // Print diagnostic TLS result as requested
-        String backendHost = claimUrl.substring(claimUrl.indexOf("://") + 3);
-        int slashPos = backendHost.indexOf('/');
-        if (slashPos > 0) backendHost = backendHost.substring(0, slashPos);
-        int colonPos = backendHost.indexOf(':');
-        if (colonPos > 0) backendHost = backendHost.substring(0, colonPos);
-        
-        IPAddress resolvedIP;
-        if (WiFi.hostByName(backendHost.c_str(), resolvedIP)) {
-          bool tlsConnected = client.connect(resolvedIP, 443);
-          Serial.print("\nTLS result: ");
-          Serial.println(tlsConnected ? "CONNECTED" : "FAILED");
-          if (tlsConnected) {
-            Serial.println("TLS handshake successful.");
-            client.stop(); // close diagnostic connection
-          }
-        }
+        // Timeout in milliseconds (10 seconds)
+        client.setTimeout(10000);
         
         http.begin(client, claimUrl);
         http.addHeader("Content-Type", "application/json");
