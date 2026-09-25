@@ -14,9 +14,10 @@ interface Props {
   sessionToken?: string;
   onComplete: () => void;
   onRetry: () => void;
+  onCancel: () => void;
 }
 
-export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId, sessionToken, onComplete, onRetry }: Props) => {
+export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId, sessionToken, onComplete, onRetry, onCancel }: Props) => {
   const [progress, setProgress] = useState(0);
   const [status, setStatus] = useState('Initializing...');
   const [error, setError] = useState<string | null>(null);
@@ -191,12 +192,20 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
             }}>
               Retry Network Selection
             </Button>
+            <Button variant="ghost" className="w-full text-gray-500" onClick={onCancel}>
+              Cancel Setup
+            </Button>
           </div>
         ) : (
           <>
             <Loader2 className="h-12 w-12 animate-spin mx-auto text-blue-600" />
             <Progress value={progress} className="w-full h-3" />
             <p className="text-sm font-medium text-gray-700 animate-pulse">{status}</p>
+            <div className="pt-4">
+              <Button variant="outline" className="w-full" onClick={onCancel}>
+                Cancel
+              </Button>
+            </div>
           </>
         )}
       </div>

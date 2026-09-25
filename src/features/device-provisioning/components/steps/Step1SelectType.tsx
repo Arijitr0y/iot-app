@@ -8,11 +8,12 @@ import { Loader2 } from 'lucide-react';
 
 interface Props {
   onNext: () => void;
+  onBack: () => void;
   onSelect: (type: any) => void;
   selectedType: any | null;
 }
 
-export const Step1SelectType = ({ onNext, onSelect, selectedType }: Props) => {
+export const Step1SelectType = ({ onNext, onBack, onSelect, selectedType }: Props) => {
   const [activeCategory, setActiveCategory] = useState<string | null>(null);
 
   const { data: categories, isLoading: catLoading } = useQuery({
@@ -126,7 +127,10 @@ export const Step1SelectType = ({ onNext, onSelect, selectedType }: Props) => {
         </div>
       </div>
 
-      <div className="flex justify-end pt-4 border-t mt-8">
+      <div className="flex justify-between pt-4 border-t mt-8">
+        <Button variant="outline" onClick={onBack} className="px-8">
+          Back
+        </Button>
         <Button onClick={onNext} disabled={!selectedType} className="px-8">
           Continue
         </Button>

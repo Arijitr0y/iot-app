@@ -1,4 +1,5 @@
 import { useState, useEffect } from 'react';
+import { useNavigate } from 'react-router-dom';
 import { Card, CardContent } from '@/components/ui/card';
 import { StepIndicator } from './components/StepIndicator';
 import { Step1SelectType } from './components/steps/Step1SelectType';
@@ -10,6 +11,7 @@ import { Step6Provisioning } from './components/steps/Step6Provisioning';
 import { Step7Complete } from './components/steps/Step7Complete';
 
 export const ProvisioningWizard = () => {
+  const navigate = useNavigate();
   // Helper to load state from sessionStorage
   const loadState = (key: string, defaultValue: any) => {
     try {
@@ -52,7 +54,8 @@ export const ProvisioningWizard = () => {
       case 1:
         return (
           <Step1SelectType 
-            onNext={nextStep} 
+            onNext={nextStep}
+            onBack={() => navigate('/')}
             selectedType={selectedType}
             onSelect={setSelectedType}
           />
@@ -101,7 +104,11 @@ export const ProvisioningWizard = () => {
             sessionToken={sessionToken}
             deviceTypeId={selectedType?.id}
             onComplete={nextStep} 
-            onRetry={() => setCurrentStep(4)} 
+            onRetry={() => setCurrentStep(4)}
+            onCancel={() => {
+              sessionStorage.removeItem('provisioning_step6_sent');
+              setCurrentStep(1);
+            }}
           />
         );
       case 7:
