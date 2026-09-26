@@ -135,26 +135,36 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
         // Now call the backend to setup the provisioning claim
         const backendUrl = import.meta.env.VITE_API_URL;
         let claimRes;
-        try {
-          claimRes = await fetch(`${backendUrl}/api/devices/provision_setup`, {
-            method: 'POST',
-            headers: {
-              'Content-Type': 'application/json',
-              'Authorization': `Bearer ${session.access_token}`
-            },
-            body: JSON.stringify({ mac_address: deviceMac, session_token: sessionToken })
-          });
-        } catch (fetchErr: any) {
-          throw new Error(`Failed to contact backend (${backendUrl}): ${fetchErr.message}. This is likely a CORS error or your mobile network is blocking the domain. Try using Wi-Fi instead of cellular data.`);
+        
+        // Retry the fetch up to 10 times in case the phone's network is still switching
+        for (let attempt = 1; attempt <= 10; attempt++) {
+          try {
+            claimRes = await fetch(`${backendUrl}/api/devices/provision_setup`, {
+              method: 'POST',
+              headers: {
+                'Content-Type': 'application/json',
+                'Authorization': `Bearer ${session.access_token}`
+              },
+              body: JSON.stringify({ mac_address: deviceMac, session_token: sessionToken })
+            });
+            break; // Success or HTTP error, exit retry loop
+          } catch (fetchErr: any) {
+            if (attempt === 10) {
+              throw new Error(`Failed to contact backend (${backendUrl}): ${fetchErr.message}. This is likely a CORS error or your mobile network is blocking the domain. Try using Wi-Fi instead of cellular data.`);
+            }
+            if (!isMounted) return;
+            setStatus(`Reconnecting to backend... (Attempt ${attempt}/10)`);
+            await new Promise(r => setTimeout(r, 2000));
+          }
         }
 
-        if (!claimRes.ok) {
+        if (!claimRes || !claimRes.ok) {
           let errText = 'Unknown error';
           try { 
             const errorJson = await claimRes.json(); 
             errText = errorJson.details || errorJson.error || await claimRes.text();
           } catch(e) {}
-          throw new Error(`Failed to setup device provisioning claim. Server says: ${claimRes.status} ${errText}`);
+          throw new Error(`Failed to setup device provisioning claim. Server says: ${claimRes?.status || 'No Response'} ${errText}`);
         }
         
         if (!isMounted) return;

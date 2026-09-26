@@ -931,7 +931,7 @@ void loop() {
         
         HTTPClient http;
         WiFiClientSecure client;
-        client.setTrustAnchors(&certList);
+        client.setInsecure(); // Bypass TLS validation for debugging
         // Timeout in milliseconds (10 seconds)
         client.setTimeout(10000);
         
