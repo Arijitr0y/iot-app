@@ -150,7 +150,10 @@ export const Step6Provisioning = ({ ssid, password = '', deviceMac, deviceTypeId
 
         if (!claimRes.ok) {
           let errText = 'Unknown error';
-          try { errText = await claimRes.text(); } catch(e) {}
+          try { 
+            const errorJson = await claimRes.json(); 
+            errText = errorJson.details || errorJson.error || await claimRes.text();
+          } catch(e) {}
           throw new Error(`Failed to setup device provisioning claim. Server says: ${claimRes.status} ${errText}`);
         }
         

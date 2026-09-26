@@ -115,7 +115,12 @@ async function authenticateUser(req, res) {
 
   const { data: { user }, error: authError } = await supabase.auth.getUser(token);
   if (authError || !user) {
-    res.status(401).json({ success: false, error: 'Unauthorized: Invalid token' });
+    console.error('[AUTH ERROR] Invalid token verification failed:', authError);
+    res.status(401).json({ 
+      success: false, 
+      error: 'Unauthorized: Invalid token',
+      details: authError ? authError.message : 'User not found'
+    });
     return null;
   }
   
