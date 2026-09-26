@@ -564,8 +564,10 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       Serial.println(debugMode ? "true" : "false");
     }
     
-    // Publish new state back
-    publishState();
+    // We do NOT call publishState() here synchronously.
+    // setRelayState() sets pendingStatePublish = true, which allows the main loop 
+    // to debounce the state publish (max once per 250ms). This prevents TLS 
+    // buffer overflows if the user spams the on/off button!
   }
 }
 
@@ -596,7 +598,6 @@ bool reconnectMQTT() {
     // Subscribe to topics
     mqttClient.subscribe(mqtt_topic_command.c_str());
     mqttClient.subscribe(mqtt_topic_schedules.c_str());
-    mqttClient.subscribe(mqtt_topic_ota.c_str());
     
     // Print current time
     time_t now = time(nullptr);
@@ -811,6 +812,9 @@ void setup() {
   // This prevents the ESP8266 from buffering small MQTT packets (like ACKs) 
   // over TLS, which can artificially delay them by 200-500ms.
   espClient.setNoDelay(true); 
+  
+  // Increase MQTT buffer size to handle JSON payloads larger than the 128-byte default
+  mqttClient.setBufferSize(512);
   
   mqttClient.setServer(mqtt_server, mqtt_port);
   mqttClient.setCallback(mqttCallback);

@@ -38,14 +38,14 @@ export const Step5EnterPassword = ({ ssid, onNext, onBack }: Props) => {
               onChange={(e) => setPassword(e.target.value)}
               required
               autoFocus
-              className="pr-10"
+              className="pr-16"
             />
             <button
               type="button"
-              className="absolute inset-y-0 right-0 pr-3 flex items-center text-gray-400 hover:text-gray-600 focus:outline-none"
+              className="absolute inset-y-0 right-0 pr-3 flex items-center text-sm font-medium text-blue-600 hover:text-blue-800 focus:outline-none"
               onClick={() => setShowPassword(!showPassword)}
             >
-              {showPassword ? <EyeOff className="h-5 w-5" /> : <Eye className="h-5 w-5" />}
+              {showPassword ? "Hide" : "Show"}
             </button>
           </div>
         </div>

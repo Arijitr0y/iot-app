@@ -120,6 +120,19 @@ export const ProvisioningWizard = () => {
 
   return (
     <div className="max-w-4xl mx-auto py-8 px-4">
+      <div className="flex justify-between items-center mb-6">
+        <h1 className="text-2xl font-bold text-gray-800">Add New Device</h1>
+        <button 
+          onClick={() => {
+            sessionStorage.clear();
+            navigate('/');
+          }}
+          className="text-gray-500 hover:text-gray-800 font-medium text-sm transition-colors"
+        >
+          Cancel Setup
+        </button>
+      </div>
+      
       <StepIndicator currentStep={currentStep} totalSteps={totalSteps} />
       
       <Card className="shadow-lg border-0 bg-white/50 backdrop-blur-sm">
