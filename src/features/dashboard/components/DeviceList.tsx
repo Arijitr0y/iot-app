@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardDescription, CardHeader, CardTitle } from '@/components/ui/card';
 import { Badge } from '@/components/ui/badge';
@@ -25,20 +25,48 @@ interface DeviceListProps {
 
 const DeviceRow = ({ device }: { device: Device }) => {
   const [isOn, setIsOn] = useState(device.relay_state || false);
+  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
+  const targetStateRef = useRef<boolean>(device.relay_state || false);
+  
   const isOnline = device.status === 'online';
   const waterLevel = device.water_level || 0;
 
   useEffect(() => {
-    setIsOn(device.relay_state || false);
+    // Pause WebSockets: Only sync from database if the user is not actively clicking
+    if (!debounceTimer.current) {
+      setIsOn(device.relay_state || false);
+      targetStateRef.current = device.relay_state || false;
+    }
   }, [device.relay_state]);
 
   const toggleDevice = () => {
-    const newAction = isOn ? 'off' : 'on';
-    publishDeviceCommand(device.id, newAction).catch(console.error);
+    // Calculate from Ref: completely bypasses React asynchronous state batching
+    const nextState = !targetStateRef.current;
     
-    // Optimistic UI update (optional, but makes it feel faster)
-    // Real state will be confirmed when ESP publishes back to /state
-    setIsOn(!isOn);
+    // Immediately update both the Ref and the React state
+    targetStateRef.current = nextState;
+    setIsOn(nextState);
+
+    // Network Debouncing: Clear previous timer
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+
+    // Start a new 400ms countdown
+    debounceTimer.current = setTimeout(async () => {
+      try {
+        const action = nextState ? 'on' : 'off';
+        await publishDeviceCommand(device.id, action);
+      } catch (error) {
+        console.error('Failed to send command:', error);
+        // Error Reversion: Snap back to truth
+        setIsOn(device.relay_state || false);
+        targetStateRef.current = device.relay_state || false;
+      } finally {
+        // Cleanup: Release the lock so database updates can sync again
+        debounceTimer.current = null;
+      }
+    }, 400);
   };
 
   const navigate = useNavigate();

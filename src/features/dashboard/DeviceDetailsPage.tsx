@@ -1,4 +1,4 @@
-import { useState, useEffect } from 'react';
+import { useState, useEffect, useRef } from 'react';
 import { useParams, useNavigate } from 'react-router-dom';
 import { Card, CardContent, CardHeader, CardTitle } from '@/components/ui/card';
 import { Button } from '@/components/ui/button';
@@ -14,6 +14,8 @@ export const DeviceDetailsPage = () => {
   const [isOnline, setIsOnline] = useState(false);
   const [isOn, setIsOn] = useState(false);
   const [loading, setLoading] = useState(true);
+  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
+  const targetStateRef = useRef<boolean>(false);
 
   useEffect(() => {
     let isMounted = true;
@@ -34,6 +36,7 @@ export const DeviceDetailsPage = () => {
       } else if (isMounted && data) {
         setDevice(data);
         setIsOn(data.relay_state || false);
+        targetStateRef.current = data.relay_state || false;
       }
       if (isMounted) setLoading(false);
     };
@@ -45,7 +48,13 @@ export const DeviceDetailsPage = () => {
         .on('postgres_changes', { event: 'UPDATE', schema: 'public', table: 'user_devices', filter: `mac_address=eq.${deviceId}` }, (payload) => {
           const updatedRow = payload.new;
           if (updatedRow.status) setIsOnline(updatedRow.status === 'online');
-          if (updatedRow.relay_state !== undefined) setIsOn(updatedRow.relay_state);
+          if (updatedRow.relay_state !== undefined) {
+            // Pause WebSockets: Only sync from database if the user is not actively clicking
+            if (!debounceTimer.current) {
+              setIsOn(updatedRow.relay_state);
+              targetStateRef.current = updatedRow.relay_state;
+            }
+          }
         })
         .subscribe();
         
@@ -58,11 +67,34 @@ export const DeviceDetailsPage = () => {
 
   const toggleDevice = () => {
     if (!device) return;
-    const newAction = isOn ? 'off' : 'on';
-    publishDeviceCommand(device.id, newAction).catch(console.error);
     
-    // Optimistic UI update
-    setIsOn(!isOn);
+    // Calculate from Ref: completely bypasses React asynchronous state batching
+    const nextState = !targetStateRef.current;
+    
+    // Immediately update both the Ref and the React state
+    targetStateRef.current = nextState;
+    setIsOn(nextState);
+
+    // Network Debouncing: Clear previous timer
+    if (debounceTimer.current) {
+      clearTimeout(debounceTimer.current);
+    }
+
+    // Start a new 400ms countdown
+    debounceTimer.current = setTimeout(async () => {
+      try {
+        const action = nextState ? 'on' : 'off';
+        await publishDeviceCommand(device.id, action);
+      } catch (error) {
+        console.error('Failed to send command:', error);
+        // Error Reversion: Snap back to truth
+        setIsOn(device.relay_state || false);
+        targetStateRef.current = device.relay_state || false;
+      } finally {
+        // Cleanup: Release the lock so database updates can sync again
+        debounceTimer.current = null;
+      }
+    }, 400);
   };
 
   if (loading) {
