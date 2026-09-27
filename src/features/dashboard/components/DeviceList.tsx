@@ -25,15 +25,16 @@ interface DeviceListProps {
 
 const DeviceRow = ({ device }: { device: Device }) => {
   const [isOn, setIsOn] = useState(device.relay_state || false);
-  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isRequestPending = useRef<boolean>(false);
   const targetStateRef = useRef<boolean>(device.relay_state || false);
   
   const isOnline = device.status === 'online';
   const waterLevel = device.water_level || 0;
 
   useEffect(() => {
-    // Pause WebSockets: Only sync from database if the user is not actively clicking
-    if (!debounceTimer.current) {
+    // Pause WebSockets: Only sync if no timer is ticking AND no request is currently in flight
+    if (!debounceTimer.current && !isRequestPending.current) {
       setIsOn(device.relay_state || false);
       targetStateRef.current = device.relay_state || false;
     }
@@ -54,6 +55,12 @@ const DeviceRow = ({ device }: { device: Device }) => {
 
     // Start a new 400ms countdown
     debounceTimer.current = setTimeout(async () => {
+      // The timer has fired. We clear its ref immediately so future clicks can start a new clean timer
+      debounceTimer.current = null;
+      
+      // Lock WebSockets while the actual network request is in flight
+      isRequestPending.current = true;
+      
       try {
         const action = nextState ? 'on' : 'off';
         await publishDeviceCommand(device.id, action);
@@ -63,8 +70,8 @@ const DeviceRow = ({ device }: { device: Device }) => {
         setIsOn(device.relay_state || false);
         targetStateRef.current = device.relay_state || false;
       } finally {
-        // Cleanup: Release the lock so database updates can sync again
-        debounceTimer.current = null;
+        // Release the WebSocket lock
+        isRequestPending.current = false;
       }
     }, 400);
   };

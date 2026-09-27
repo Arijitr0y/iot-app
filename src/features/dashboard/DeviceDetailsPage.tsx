@@ -14,7 +14,8 @@ export const DeviceDetailsPage = () => {
   const [isOnline, setIsOnline] = useState(false);
   const [isOn, setIsOn] = useState(false);
   const [loading, setLoading] = useState(true);
-  const debounceTimer = useRef<NodeJS.Timeout | null>(null);
+  const debounceTimer = useRef<ReturnType<typeof setTimeout> | null>(null);
+  const isRequestPending = useRef<boolean>(false);
   const targetStateRef = useRef<boolean>(false);
 
   useEffect(() => {
@@ -49,8 +50,8 @@ export const DeviceDetailsPage = () => {
           const updatedRow = payload.new;
           if (updatedRow.status) setIsOnline(updatedRow.status === 'online');
           if (updatedRow.relay_state !== undefined) {
-            // Pause WebSockets: Only sync from database if the user is not actively clicking
-            if (!debounceTimer.current) {
+            // Pause WebSockets: Only sync if no timer is ticking AND no request is currently in flight
+            if (!debounceTimer.current && !isRequestPending.current) {
               setIsOn(updatedRow.relay_state);
               targetStateRef.current = updatedRow.relay_state;
             }
@@ -82,6 +83,12 @@ export const DeviceDetailsPage = () => {
 
     // Start a new 400ms countdown
     debounceTimer.current = setTimeout(async () => {
+      // The timer has fired. We clear its ref immediately so future clicks can start a new clean timer
+      debounceTimer.current = null;
+      
+      // Lock WebSockets while the actual network request is in flight
+      isRequestPending.current = true;
+
       try {
         const action = nextState ? 'on' : 'off';
         await publishDeviceCommand(device.id, action);
@@ -91,8 +98,8 @@ export const DeviceDetailsPage = () => {
         setIsOn(device.relay_state || false);
         targetStateRef.current = device.relay_state || false;
       } finally {
-        // Cleanup: Release the lock so database updates can sync again
-        debounceTimer.current = null;
+        // Release the WebSocket lock
+        isRequestPending.current = false;
       }
     }, 400);
   };
