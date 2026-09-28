@@ -25,6 +25,7 @@ import rateLimit from 'express-rate-limit';
 import mqtt from 'mqtt';
 import crypto from 'crypto';
 import { config } from './config.js';
+import { createHealthRouter } from './health.js';
 
 const execPromise = util.promisify(exec);
 const app = express();
@@ -56,6 +57,9 @@ mqttClient.on('error', (err) => {
 });
 
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY);
+
+// Mount health check endpoints (before rate limiter if you want it globally accessible without limits, but we can just mount it here)
+app.use('/health', createHealthRouter(mqttClient, supabase));
 
 // In-memory cache for device provisioning claims
 // Map of MAC Address -> { token, userId, expiresAt }
