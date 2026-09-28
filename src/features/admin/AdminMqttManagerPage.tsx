@@ -1,4 +1,5 @@
 import { MqttAclManager } from './MqttAclManager';
+import { MqttConfigurationSync } from './MqttConfigurationSync';
 
 export const AdminMqttManagerPage = () => {
   return (
@@ -8,6 +9,7 @@ export const AdminMqttManagerPage = () => {
         <p className="text-gray-500">Manage Mosquitto service accounts and topic Access Control Lists (ACLs).</p>
       </div>
       
+      <MqttConfigurationSync />
       <MqttAclManager />
     </div>
   );
