@@ -285,13 +285,6 @@ app.post('/api/devices/:deviceId/schedules', commandIpLimiter, commandDeviceLimi
 
 app.post('/api/mqtt/sync', async (req, res) => {
   try {
-    // Ensure docker CLI is available in the environment running this script
-    try {
-      await execPromise('docker --version');
-    } catch (err) {
-      throw new Error('Docker CLI is not available in this environment. If running inside a container, you must mount /var/run/docker.sock and install the docker CLI, or run this script directly on the host VM using PM2.');
-    }
-
     const authHeader = req.headers.authorization;
     if (!authHeader) {
       return res.status(401).json({ success: false, error: 'Unauthorized: Missing Bearer token' });
@@ -324,85 +317,59 @@ app.post('/api/mqtt/sync', async (req, res) => {
     const { data: acls, error: aclsErr } = await supabase.from('mqtt_acls').select('*');
     if (aclsErr) throw aclsErr;
 
-    // 3. Rebuild the Passwords file
-    // We recreate the file from scratch to handle deletions properly
-    try {
-      await fs.writeFile(PASSWORDS_FILE_PATH, ''); // Clear file
-    } catch (e) {
-      // If file doesn't exist, it will be created. Ensure dir exists.
-      await fs.mkdir(MOSQUITTO_CONFIG_DIR, { recursive: true });
-      await fs.writeFile(PASSWORDS_FILE_PATH, '');
-    }
+    // Build the JSON payload for MQTT Manager
+    const managerUsers = users
+      .filter(u => u.password_hash)
+      .map(u => ({
+        username: u.username,
+        password: u.password_hash
+      }));
 
-    for (const user of users) {
-      if (!user.password_hash) continue; // Skip users without a password set
-
-      // Use docker exec to run mosquitto_passwd inside the container
-      // -b means batch mode (username password)
-      try {
-        const { execFile } = await import('child_process');
-        const execFilePromise = util.promisify(execFile);
-        
-        await execFilePromise('docker', [
-          'exec', 
-          config.MOSQUITTO_CONTAINER_NAME, 
-          'mosquitto_passwd', 
-          '-b', 
-          '/mosquitto/config/passwords', 
-          user.username, 
-          user.password_hash
-        ]);
-        console.log(`🔑 Generated credentials for: ${user.username}`);
-      } catch (execErr) {
-        console.error(`Failed to generate password for ${user.username}:`, execErr.message);
-      }
-    }
-
-    // 4. Rebuild the ACL file
-    let aclContent = '';
-
-    // Group ACLs by user
-    const aclsByUser = users.reduce((acc, user) => {
-      acc[user.id] = { username: user.username, rules: [] };
+    // Create a username lookup map to assign acls to the correct username
+    const usernameMap = users.reduce((acc, u) => {
+      acc[u.id] = u.username;
       return acc;
     }, {});
 
-    for (const acl of acls) {
-      if (aclsByUser[acl.user_id]) {
-        aclsByUser[acl.user_id].rules.push(acl);
-      }
+    const managerAcls = acls
+      .filter(acl => usernameMap[acl.user_id])
+      .map(acl => ({
+        username: usernameMap[acl.user_id],
+        topic_pattern: acl.topic_pattern,
+        access_level: acl.access_level
+      }));
+
+    // Call the internal MQTT Manager
+    const managerToken = process.env.MQTT_MANAGER_TOKEN;
+    if (!managerToken) {
+      console.error('❌ Sync failed: MQTT_MANAGER_TOKEN is missing');
+      throw new Error('Internal configuration error');
     }
 
-    for (const userId in aclsByUser) {
-      const userAcls = aclsByUser[userId];
-      if (userAcls.rules.length > 0) {
-        aclContent += `user ${userAcls.username}\n`;
-        for (const rule of userAcls.rules) {
-          if (rule.access_level === 'readwrite') {
-            aclContent += `topic readwrite ${rule.topic_pattern}\n`;
-          } else {
-            aclContent += `topic ${rule.access_level} ${rule.topic_pattern}\n`;
-          }
-        }
-        aclContent += '\n';
-      }
+    console.log(`📡 Sending sync payload to MQTT Manager...`);
+    const managerRes = await fetch('http://iot-mqtt-manager:3100/internal/sync', {
+      method: 'POST',
+      headers: {
+        'Content-Type': 'application/json',
+        'Authorization': `Bearer ${managerToken}`
+      },
+      body: JSON.stringify({
+        users: managerUsers,
+        acls: managerAcls
+      })
+    });
+
+    if (!managerRes.ok) {
+      console.error(`❌ Sync failed: MQTT Manager returned ${managerRes.status}`);
+      throw new Error('Failed to synchronize MQTT configuration');
     }
-
-    // Write ACL file
-    await fs.writeFile(ACL_FILE_PATH, aclContent);
-    console.log(`🛡️ Generated ACL file with ${acls.length} rules.`);
-
-    // 5. Trigger Dynamic Reload (SIGHUP)
-    // SIGHUP tells mosquitto to reload configuration, passwords, and ACL files without dropping active connections.
-    console.log(`📡 Reloading Mosquitto container (${config.MOSQUITTO_CONTAINER_NAME})...`);
-    await execPromise(`docker exec ${config.MOSQUITTO_CONTAINER_NAME} kill -SIGHUP 1`);
 
     console.log('✅ Sync complete.');
     res.json({ success: true, message: 'Mosquitto synced and reloaded successfully' });
 
   } catch (err) {
-    console.error('❌ Sync failed:', err);
-    res.status(500).json({ success: false, error: err.message });
+    console.error('❌ Sync failed:', err.message || err);
+    res.status(500).json({ success: false, error: err.message || 'Internal server error during sync operation' });
   }
 });
 
