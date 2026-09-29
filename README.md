@@ -16,6 +16,11 @@ This repository contains the complete source code for an end-to-end secure IoT P
 - **Tech Stack:** C++ (Arduino Core)
 - **Data Flow:** The ESP8266 connects via secure TLS to the Mosquitto broker. It receives provisioning tokens via a localized Access Point (AP) mode that requires a physical 5-second button press to initiate. All MQTT logic is idempotently tracked (duplicate commands are ignored).
 
+**Database Domain Architecture**
+- **Canonical Model (Current Phase):** The system relies on a multi-tenant device hierarchy with `tenants`, `products`, `device_models`, and `devices`. Each device belongs to exactly one `device_model`, which belongs to one `product`, which belongs to one `tenant`.
+- **RBAC & Assignments:** Administrative control utilizes the `is_admin()` custom Postgres function. Standard user access to physical devices is enforced by `device_assignments`, strictly enforcing row-level security (RLS). Ordinary users can only view devices assigned to them and relevant relational entities.
+- **Legacy Compatibility:** The initial single-table prototype structure (`user_devices`, `device_types`, `device_categories`) is still preserved as a fallback compatibility layer. Do not modify or drop `user_devices` during the progressive transition. A `legacy_device_map` table bridges the old and new models.
+
 ## Local Development
 
 ### 1. Environment Setup

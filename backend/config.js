@@ -28,9 +28,5 @@ export const config = {
   MQTT_USERNAME: process.env.MQTT_USERNAME,
   MQTT_PASSWORD: process.env.MQTT_PASSWORD,
   FRONTEND_URL: process.env.FRONTEND_URL || 'https://iot-app-opal-two.vercel.app',
-  PORT: process.env.PORT ? parseInt(process.env.PORT, 10) : 3001,
-
-  // Specific to sync API
-  MOSQUITTO_CONTAINER_NAME: process.env.MOSQUITTO_CONTAINER_NAME || 'iot-mosquitto',
-  MOSQUITTO_CONFIG_DIR: process.env.MOSQUITTO_CONFIG_DIR || './mosquitto/config',
+  PORT: process.env.PORT ? parseInt(process.env.PORT, 10) : 3001
 };

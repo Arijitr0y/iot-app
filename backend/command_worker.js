@@ -26,7 +26,7 @@ mqttClient.on('message', async (topic, message) => {
     const mac = topic.split('/')[2];
     try {
       const payload = JSON.parse(message.toString());
-      const cmd_id = payload.cmd_id;
+      const cmd_id = payload.cmd_id; // Frontend/Device uses this
       const status = payload.status; // 'success' or 'failed'
       
       console.log(`📡 ACK from ${mac} for cmd ${cmd_id}: ${status}`);
@@ -37,21 +37,18 @@ mqttClient.on('message', async (topic, message) => {
           activeCommands.delete(cmd_id);
         }
 
-        // Calculate execution time (difference between now and sent_at)
-        const { data: cmdRow } = await supabase.from('device_commands').select('sent_at').eq('id', cmd_id).single();
-        let execTime = null;
-        if (cmdRow && cmdRow.sent_at) {
-          execTime = new Date().getTime() - new Date(cmdRow.sent_at).getTime();
-        }
-
-        // Update DB
+        // Update DB using canonical correlation_id
+        const finalStatus = status === 'success' ? 'COMPLETED' : 'FAILED';
+        const updatePayload = { 
+            status: finalStatus,
+            acknowledged_at: new Date().toISOString()
+        };
+        if (finalStatus === 'COMPLETED') updatePayload.completed_at = new Date().toISOString();
+        if (finalStatus === 'FAILED') updatePayload.failed_at = new Date().toISOString();
+        
         await supabase.from('device_commands')
-          .update({ 
-            status: status === 'success' ? 'acknowledged' : 'failed',
-            acknowledged_at: new Date().toISOString(),
-            execution_time_ms: execTime
-          })
-          .eq('id', cmd_id);
+          .update(updatePayload)
+          .eq('correlation_id', cmd_id);
       }
     } catch (e) {
       console.error('Error parsing MQTT ack message', e);
@@ -63,47 +60,25 @@ async function processCommands() {
   // 1. Process pending commands
   const { data: pendingCmds } = await supabase
     .from('device_commands')
-    .select('*, user_devices(mac_address, owner_id)')
-    .eq('status', 'pending')
+    .select('*, devices(mac_address)')
+    .eq('status', 'PENDING')
     .order('created_at', { ascending: true });
 
   for (const cmd of pendingCmds || []) {
-    const mac = cmd.user_devices.mac_address;
-    const ownerId = cmd.user_devices.owner_id;
-    const createdBy = cmd.created_by;
+    const mac = cmd.devices?.mac_address;
 
-    if (!mac) continue;
-
-    // Backend authorization validation (Defense-in-depth)
-    let isAuthorized = false;
-    if (createdBy === ownerId) {
-      isAuthorized = true;
-    } else if (createdBy) {
-      // Check if created_by is an admin
-      const { data: roleData } = await supabase
-        .from('admin_user_roles')
-        .select('access_level')
-        .eq('user_id', createdBy)
-        .single();
-      if (roleData && roleData.access_level === 'admin_panel') {
-        isAuthorized = true;
-      }
+    if (!mac) {
+        console.error(`🚨 Command ${cmd.id} has no valid MAC address mapped. Failing.`);
+        await supabase.from('device_commands').update({ status: 'FAILED', last_error: 'No MAC Address' }).eq('id', cmd.id);
+        continue;
     }
 
-    if (!isAuthorized) {
-      console.error(`🚨 Unauthorized command attempt by ${createdBy} on device ${mac}`);
-      await supabase.from('device_commands')
-        .update({ status: 'failed', error_message: 'Unauthorized: You do not own this device' })
-        .eq('id', cmd.id);
-      continue;
-    }
-
-    console.log(`📤 Sending ${cmd.command_type} to ${mac} (ID: ${cmd.id})`);
+    console.log(`📤 Sending ${cmd.command_type} to ${mac} (Cmd ID: ${cmd.correlation_id})`);
     
-    // Set status to sent
+    // Set status to SENT
     const sentAt = new Date().toISOString();
     await supabase.from('device_commands')
-      .update({ status: 'sent', sent_at: sentAt })
+      .update({ status: 'SENT', sent_at: sentAt })
       .eq('id', cmd.id);
 
     // Send MQTT
@@ -111,38 +86,37 @@ async function processCommands() {
     const payload = JSON.stringify({
       ...cmd.payload,
       action: cmd.command_type,
-      cmd_id: cmd.id
+      cmd_id: cmd.correlation_id
     });
     
     mqttClient.publish(topic, payload, { qos: 1 });
 
     // Track for timeout
     const timeout = setTimeout(async () => {
-      console.log(`❌ Timeout for cmd ${cmd.id}`);
-      activeCommands.delete(cmd.id);
+      console.log(`❌ Timeout for cmd ${cmd.correlation_id}`);
+      activeCommands.delete(cmd.correlation_id);
       
-      // Determine if we should retry
-      if (cmd.retry_count < cmd.max_retries) {
-        console.log(`🔄 Retrying cmd ${cmd.id} (${cmd.retry_count + 1}/${cmd.max_retries})`);
+      if (cmd.attempt_count < 3) {
+        console.log(`🔄 Retrying cmd ${cmd.correlation_id} (${cmd.attempt_count + 1}/3)`);
         await supabase.from('device_commands')
           .update({ 
-            status: 'pending', 
-            retry_count: cmd.retry_count + 1,
-            error_message: 'Timeout, retrying...'
+            status: 'PENDING', 
+            attempt_count: cmd.attempt_count + 1,
+            last_error: 'Timeout, retrying...'
           })
           .eq('id', cmd.id);
       } else {
-        console.log(`💀 Cmd ${cmd.id} failed after max retries.`);
+        console.log(`💀 Cmd ${cmd.correlation_id} failed after max retries.`);
         await supabase.from('device_commands')
           .update({ 
-            status: 'failed',
-            error_message: 'Timeout, max retries reached'
+            status: 'FAILED',
+            last_error: 'Timeout, max retries reached'
           })
           .eq('id', cmd.id);
       }
     }, COMMAND_TIMEOUT_MS);
 
-    activeCommands.set(cmd.id, timeout);
+    activeCommands.set(cmd.correlation_id, timeout);
   }
 }
 

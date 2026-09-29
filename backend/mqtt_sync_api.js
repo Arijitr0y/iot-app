@@ -16,10 +16,7 @@
 
 import express from 'express';
 import { createClient } from '@supabase/supabase-js';
-import { exec } from 'child_process';
-import util from 'util';
 import fs from 'fs/promises';
-import path from 'path';
 import cors from 'cors';
 import rateLimit from 'express-rate-limit';
 import mqtt from 'mqtt';
@@ -27,7 +24,6 @@ import crypto from 'crypto';
 import { config } from './config.js';
 import { createHealthRouter } from './health.js';
 
-const execPromise = util.promisify(exec);
 const app = express();
 
 // Enable CORS for all origins (safe because endpoints require JWT authentication)
@@ -61,9 +57,7 @@ const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_
 // Mount health check endpoints (before rate limiter if you want it globally accessible without limits, but we can just mount it here)
 app.use('/health', createHealthRouter(mqttClient, supabase));
 
-// In-memory cache for device provisioning claims
-// Map of MAC Address -> { token, userId, expiresAt }
-const pendingProvisioningClaims = new Map();
+// Database-backed claims are now used.
 
 
 const MOSQUITTO_CONFIG_DIR = config.MOSQUITTO_CONFIG_DIR;
@@ -209,28 +203,37 @@ app.post('/api/devices/:deviceId/command', commandIpLimiter, commandDeviceLimite
       return res.status(400).json({ success: false, error: 'Factory reset requires explicit confirmation flag' });
     }
 
-    // Construct topic securely server-side
-    const topic = `iot/devices/${device.mac_address}/command`;
-    
-    // Construct payload strictly overriding frontend injection attempts
     const cmd_id = crypto.randomUUID();
     const finalPayload = {
-      ...(frontendPayload || {}), // Spread frontend provided params first (if any)
-      action,                     // Explicitly override action
-      cmd_id,                     // Server-generated idempotency token
-      device_id: device.id,       // Explicitly override device_id
-      mac_address: device.mac_address // Explicitly override mac_address
+      ...(frontendPayload || {}),
+      action
     };
 
-    console.log(`[AUDIT] User ${user.id} executed '${action}' on device ${device.id} (MAC: ${device.mac_address})`);
+    // Use legacy_device_map to find canonical device id if necessary
+    let canonicalDeviceId = device.id;
+    if (!device.device_uid) {
+        const { data: map } = await supabase.from('legacy_device_map').select('device_id').eq('legacy_user_device_id', device.id).single();
+        if (map) canonicalDeviceId = map.device_id;
+    }
 
-    mqttClient.publish(topic, JSON.stringify(finalPayload), { qos: 1 }, (err) => {
-      if (err) {
-        console.error(`MQTT publish failed for ${device.mac_address}:`, err.message);
-        return res.status(500).json({ success: false, error: 'Failed to dispatch command to broker' });
-      }
-      res.json({ success: true, message: 'Command dispatched successfully', cmd_id });
-    });
+    const { error: cmdErr } = await supabase
+      .from('device_commands')
+      .insert({
+        device_id: canonicalDeviceId,
+        command_type: action,
+        payload: finalPayload,
+        status: 'PENDING',
+        created_by: user.id,
+        correlation_id: cmd_id
+      });
+
+    if (cmdErr) {
+      console.error(`Failed to insert command for ${device.mac_address}:`, cmdErr);
+      return res.status(500).json({ success: false, error: 'Failed to queue command' });
+    }
+
+    console.log(`[AUDIT] User ${user.id} queued '${action}' for device ${device.id}`);
+    res.json({ success: true, message: 'Command queued successfully', cmd_id });
   } catch (err) {
     console.error('Command endpoint error:', err);
     res.status(500).json({ success: false, error: 'Internal server error' });
@@ -499,26 +502,42 @@ app.post('/api/devices/provision_setup', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing mac_address or session_token' });
     }
 
-    // Verify the user owns this device
-    const { data: device, error } = await supabase
-      .from('user_devices')
-      .select('id')
-      .eq('mac_address', mac_address)
-      .eq('owner_id', user.id)
-      .single();
-
-    if (error || !device) {
-      return res.status(403).json({ success: false, error: 'Forbidden: Device not found or not owned by you' });
+    // Lookup device. Check canonical first, then legacy.
+    let deviceId = null;
+    const { data: device } = await supabase.from('devices').select('id').eq('mac_address', mac_address).single();
+    if (device) {
+       deviceId = device.id;
+    } else {
+       const { data: legacyDevice, error: legacyErr } = await supabase
+         .from('user_devices')
+         .select('id, owner_id')
+         .eq('mac_address', mac_address)
+         .single();
+       if (legacyErr || !legacyDevice || legacyDevice.owner_id !== user.id) {
+         return res.status(403).json({ success: false, error: 'Forbidden: Device not found or not owned by you' });
+       }
+       deviceId = legacyDevice.id; 
+       
+       const { data: map } = await supabase.from('legacy_device_map').select('device_id').eq('legacy_user_device_id', deviceId).single();
+       if (map) deviceId = map.device_id;
     }
 
-    // Store claim (expires in 10 minutes)
-    pendingProvisioningClaims.set(mac_address, {
-      token: session_token,
-      userId: user.id,
-      expiresAt: Date.now() + 10 * 60000
-    });
+    const expires_at = new Date(Date.now() + 10 * 60000).toISOString();
+    const tokenHash = crypto.createHash('sha256').update(session_token).digest('hex');
 
-    console.log(`[PROVISION] Authorized claim setup for ${mac_address} by user ${user.id}`);
+    const { error: claimErr } = await supabase
+      .from('device_provisioning_claims')
+      .insert({
+        mac_address,
+        device_id: deviceId, 
+        claim_token_hash: tokenHash,
+        requested_by: user.id,
+        expires_at
+      });
+
+    if (claimErr) throw claimErr;
+
+    console.log(`[PROVISION] DB-backed claim setup for ${mac_address} by user ${user.id}`);
     res.json({ success: true, message: 'Provisioning claim setup successfully' });
   } catch (err) {
     console.error('Provision setup error:', err);
@@ -534,34 +553,47 @@ app.post('/api/devices/claim', async (req, res) => {
       return res.status(400).json({ success: false, error: 'Missing mac_address or token' });
     }
 
-    // Check pending claims
-    const claim = pendingProvisioningClaims.get(mac_address);
-    if (!claim) {
-      return res.status(404).json({ success: false, error: 'No pending provisioning claim for this device' });
-    }
+    const tokenHash = crypto.createHash('sha256').update(token).digest('hex');
 
-    if (claim.expiresAt < Date.now()) {
-      pendingProvisioningClaims.delete(mac_address);
-      return res.status(400).json({ success: false, error: 'Provisioning claim expired' });
-    }
+    const { data: claims, error: claimLookupErr } = await supabase
+      .from('device_provisioning_claims')
+      .select('*')
+      .eq('mac_address', mac_address)
+      .eq('claim_token_hash', tokenHash)
+      .is('claimed_at', null)
+      .is('revoked_at', null)
+      .gt('expires_at', new Date().toISOString())
+      .order('created_at', { ascending: false })
+      .limit(1);
 
-    if (claim.token !== token) {
-      return res.status(401).json({ success: false, error: `Invalid provisioning token: expected [${claim.token}], got [${token}]` });
+    if (claimLookupErr || !claims || claims.length === 0) {
+      return res.status(401).json({ success: false, error: 'Invalid, expired, or previously used claim token' });
+    }
+    const claim = claims[0];
+
+    // Atomically consume
+    const { data: consumedClaim, error: consumeErr } = await supabase
+      .from('device_provisioning_claims')
+      .update({ claimed_at: new Date().toISOString() })
+      .eq('id', claim.id)
+      .is('claimed_at', null)
+      .select()
+      .single();
+
+    if (consumeErr || !consumedClaim) {
+      return res.status(409).json({ success: false, error: 'Claim race condition or token reuse detected' });
     }
 
     console.log(`[PROVISION] Valid claim from ${mac_address}. Generating MQTT credentials...`);
 
-    // 1. Generate credentials
     const username = mac_address;
-    // Generate 32 char hex password (high entropy)
     const password = crypto.randomBytes(16).toString('hex');
 
-    // 2. Save to mqtt_users
     const { data: mqttUser, error: userErr } = await supabase
       .from('mqtt_users')
       .upsert({ 
         username, 
-        password_hash: password, // Mosquitto will hash this via the sync script
+        password_hash: password,
         description: `Auto-provisioned device ${mac_address}` 
       }, { onConflict: 'username' })
       .select()
@@ -569,7 +601,6 @@ app.post('/api/devices/claim', async (req, res) => {
 
     if (userErr) throw userErr;
 
-    // 3. Setup exact ACLs for this device
     const topics = [
       { topic_pattern: `iot/devices/${mac_address}/state`, access_level: 'write' },
       { topic_pattern: `iot/devices/${mac_address}/ack`, access_level: 'write' },
@@ -578,84 +609,61 @@ app.post('/api/devices/claim', async (req, res) => {
       { topic_pattern: `iot/devices/${mac_address}/schedules`, access_level: 'read' }
     ];
 
-    // Clear old ACLs if any
     await supabase.from('mqtt_acls').delete().eq('user_id', mqttUser.id);
     
-    // Insert new ACLs
     const { error: aclErr } = await supabase.from('mqtt_acls').insert(
       topics.map(t => ({ user_id: mqttUser.id, ...t }))
     );
 
     if (aclErr) throw aclErr;
 
-    // 4. Trigger Mosquitto Sync to reload credentials
-    // We execute the sync logic internally to avoid making an HTTP call to ourselves
-    // We'll just call a helper or execute a local fetch
-    try {
-      const { execFile } = await import('child_process');
-      const execFilePromise = util.promisify(execFile);
-      
-      // Update password file
-      await execFilePromise('docker', [
-        'exec', 
-        config.MOSQUITTO_CONTAINER_NAME, 
-        'mosquitto_passwd', 
-        '-b', 
-        '/mosquitto/config/passwords', 
-        username, 
-        password
-      ]);
-      
-      // We also need to reload ACLs, easiest is to trigger our own sync endpoint locally
-      // but without the JWT check. Let's just do a quick docker restart or trigger it.
-      // Wait, we can just trigger it using the service role key!
-      // But the sync endpoint requires admin.
-      // Let's just do the ACL reload manually here to guarantee atomicity for the device.
-      
-      // Fetch all ACLs again
-      const { data: users } = await supabase.from('mqtt_users').select('*');
-      const { data: acls } = await supabase.from('mqtt_acls').select('*');
-      
-      let aclContent = '';
-      const aclsByUser = users.reduce((acc, u) => {
-        acc[u.id] = { username: u.username, rules: [] };
-        return acc;
-      }, {});
-      for (const acl of acls) if (aclsByUser[acl.user_id]) aclsByUser[acl.user_id].rules.push(acl);
-      
-      for (const userId in aclsByUser) {
-        const userAcls = aclsByUser[userId];
-        if (userAcls.rules.length > 0) {
-          aclContent += `user ${userAcls.username}\n`;
-          for (const rule of userAcls.rules) {
-            if (rule.access_level === 'readwrite') {
-              aclContent += `topic readwrite ${rule.topic_pattern}\n`;
-            } else {
-              aclContent += `topic ${rule.access_level} ${rule.topic_pattern}\n`;
-            }
-          }
-          aclContent += '\n';
-        }
-      }
-      
-      await fs.writeFile(ACL_FILE_PATH, aclContent);
-      await execPromise(`docker exec ${config.MOSQUITTO_CONTAINER_NAME} kill -SIGHUP 1`);
-      
-    } catch (syncErr) {
-      console.error('Failed to immediately sync mosquitto for device:', syncErr);
-      // It might still work on next scheduled sync, but we should fail the provisioning to be safe
-      throw new Error('Failed to synchronize broker');
+    // Phase 4: Communicate with MQTT manager instead of Docker CLI directly
+    const managerToken = process.env.MQTT_MANAGER_TOKEN;
+    if (!managerToken) {
+      throw new Error('MQTT_MANAGER_TOKEN is missing');
     }
 
-    // 5. Return plaintext credentials to ESP
+    // Send full state to MQTT manager to ensure idempotency and preservation of existing users
+    const { data: allUsers } = await supabase.from('mqtt_users').select('*');
+    const { data: allAcls } = await supabase.from('mqtt_acls').select('*');
+    
+    const managerUsers = allUsers.filter(u => u.password_hash).map(u => ({ username: u.username, password: u.password_hash }));
+    const usernameMap = allUsers.reduce((acc, u) => { acc[u.id] = u.username; return acc; }, {});
+    const managerAcls = allAcls.filter(a => usernameMap[a.user_id]).map(a => ({ username: usernameMap[a.user_id], topic_pattern: a.topic_pattern, access_level: a.access_level }));
+
+    try {
+      const managerRes = await fetch('http://iot-mqtt-manager:3100/internal/sync', {
+        method: 'POST',
+        headers: {
+          'Content-Type': 'application/json',
+          'Authorization': `Bearer ${managerToken}`
+        },
+        body: JSON.stringify({ users: managerUsers, acls: managerAcls })
+      });
+
+      if (!managerRes.ok) {
+         console.error('MQTT Manager sync failed with status:', managerRes.status);
+      }
+    } catch (e) {
+       console.error('Failed to communicate with MQTT manager during provisioning', e.message);
+    }
+
     res.json({
       success: true,
       mqtt_username: username,
       mqtt_password: password
     });
-    
-    // Cleanup pending claim ONLY after fully successful operation
-    pendingProvisioningClaims.delete(mac_address);
+
+    try {
+      await supabase.from('audit_logs').insert({
+         action: 'DEVICE_CLAIMED',
+         target_type: 'DEVICE',
+         target_id: mac_address,
+         actor_id: claim.requested_by,
+         metadata: { device_id: claim.device_id }
+      });
+    } catch(e) { }
+
     console.log(`[PROVISION] Successfully provisioned MQTT credentials for ${mac_address}`);
 
   } catch (err) {

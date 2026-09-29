@@ -16,7 +16,7 @@ export interface DeviceCommand {
   created_at: string;
   sent_at?: string;
   acknowledged_at?: string;
-  user_devices?: { name: string, mac_address: string };
+  devices?: { name: string, mac_address: string };
 }
 
 interface CommandState {
@@ -35,7 +35,7 @@ export const useCommandStore = create<CommandState>((set, get) => ({
     try {
       let query = supabase
         .from('device_commands')
-        .select(`*, user_devices(name, mac_address)`)
+        .select(`*, devices(name, mac_address)`)
         .order('created_at', { ascending: false })
         .limit(100);
 

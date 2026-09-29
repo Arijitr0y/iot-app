@@ -39,6 +39,19 @@ mqttClient.on('message', async (topic, message) => {
     }
 
     const payload = JSON.parse(message.toString());
+
+    // Phase 7: Map to canonical device
+    let deviceId = null;
+    const { data: canonicalDev } = await supabase.from('devices').select('id').eq('mac_address', mac).single();
+    if (canonicalDev) {
+        deviceId = canonicalDev.id;
+    } else {
+        const { data: map } = await supabase.from('user_devices').select('id').eq('mac_address', mac).single();
+        if (map) {
+            const { data: mapping } = await supabase.from('legacy_device_map').select('device_id').eq('legacy_user_device_id', map.id).single();
+            if (mapping) deviceId = mapping.device_id;
+        }
+    }
     
     if (type === 'state') {
       const updates = {
@@ -78,7 +91,32 @@ mqttClient.on('message', async (topic, message) => {
       if (error) {
         console.error(`Failed to update state for device ${mac}:`, error);
       } else {
-        console.log(`📡 State updated for ${mac}:`, updates);
+        console.log(`📡 Legacy state updated for ${mac}`);
+      }
+
+      // Canonical Twin Update
+      if (deviceId) {
+          await supabase.from('devices').update({ 
+              last_seen_at: new Date().toISOString(),
+              status: updates.status === 'online' ? 'ACTIVE' : 'INACTIVE'
+          }).eq('id', deviceId);
+
+          const { data: twin } = await supabase.from('device_twin').select('id').eq('device_id', deviceId).single();
+          if (twin) {
+              await supabase.from('device_twin').update({
+                  reported_state: payload,
+                  last_reported_update: new Date().toISOString(),
+                  sync_status: 'SYNCED'
+              }).eq('device_id', deviceId);
+          } else {
+              await supabase.from('device_twin').insert({
+                  device_id: deviceId,
+                  reported_state: payload,
+                  last_reported_update: new Date().toISOString(),
+                  sync_status: 'SYNCED'
+              });
+          }
+          console.log(`📡 Canonical Twin updated for ${mac}`);
       }
       
     } else if (type === 'error') {
@@ -97,6 +135,10 @@ mqttClient.on('message', async (topic, message) => {
           console.error(`Failed to update error for device ${mac}:`, error);
         } else {
           console.error(`🚨 Error recorded for ${mac}: ${safeError}`);
+        }
+
+        if (deviceId) {
+            await supabase.from('device_twin').update({ sync_status: 'ERROR' }).eq('device_id', deviceId);
         }
       }
     }

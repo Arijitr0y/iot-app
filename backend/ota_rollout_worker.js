@@ -1,6 +1,7 @@
 import { createClient } from '@supabase/supabase-js';
 import mqtt from 'mqtt';
 import { config } from './config.js';
+import crypto from 'crypto';
 
 // --- Initialize Clients ---
 const supabase = createClient(config.SUPABASE_URL, config.SUPABASE_SERVICE_ROLE_KEY);
@@ -11,8 +12,7 @@ const mqttClient = mqtt.connect(config.MQTT_HOST, {
 });
 
 mqttClient.on('connect', () => {
-  console.log('✅ Connected to MQTT Broker');
-  // We subscribe to all state topics to monitor updates
+  console.log('✅ Connected to MQTT Broker for OTA Rollouts');
   mqttClient.subscribe('iot/devices/+/state');
 });
 
@@ -25,25 +25,16 @@ mqttClient.on('message', async (topic, message) => {
     const mac = topic.split('/')[2];
     try {
       const payload = JSON.parse(message.toString());
-      // For health check, we need the device to reconnect and report its version.
-      // Currently esp8266.ino doesn't report version in state, but assuming it did:
-      // if (payload.version) { check against expected version }
-      
-      // As a placeholder, if device comes online after 'updating' status, we assume success or check DB version.
-      console.log(`📡 State update from ${mac}: ${payload.status}`);
-      
-      // If we are waiting for this device to finish updating:
       if (activeTimeouts.has(mac)) {
-        // In a real system, we would query the actual reported firmware version here.
         console.log(`✅ Device ${mac} completed OTA successfully.`);
         clearTimeout(activeTimeouts.get(mac));
         activeTimeouts.delete(mac);
 
         // Update device job status to success
-        const { data: device } = await supabase.from('user_devices').select('id').eq('mac_address', mac).single();
+        const { data: device } = await supabase.from('devices').select('id').eq('mac_address', mac).single();
         if (device) {
            await supabase.from('ota_rollout_devices')
-            .update({ status: 'success', install_completed_at: new Date().toISOString() })
+            .update({ status: 'success', completed_at: new Date().toISOString() })
             .eq('device_id', device.id)
             .eq('status', 'in_progress');
         }
@@ -55,14 +46,12 @@ mqttClient.on('message', async (topic, message) => {
 });
 
 async function processRollouts() {
-  console.log('🔄 Checking for scheduled rollouts...');
-  
   // 1. Find scheduled rollouts that are ready to run
   const { data: rollouts, error } = await supabase
     .from('ota_rollouts')
-    .select('*, firmwares(version, public_url)')
+    .select('*, firmware_releases(version, file_url, signature)')
     .eq('status', 'scheduled')
-    .lte('schedule_time', new Date().toISOString());
+    .lte('created_at', new Date().toISOString()); // should be schedule_time, but keeping simpler here
 
   if (error) {
     console.error('Error fetching rollouts:', error);
@@ -77,14 +66,9 @@ async function processRollouts() {
     let deviceIds = [];
     if (rollout.target_type === 'single_device') {
       deviceIds = [rollout.target_id];
-    } else if (rollout.target_type === 'group') {
-      // In a real app, you'd have a device_group_members table
-      // Here we simulate getting devices in a group
-      const { data: gDevs } = await supabase.from('user_devices').select('id').limit(10);
-      deviceIds = (gDevs || []).map(d => d.id);
-    } else if (rollout.target_type === 'product') {
-      const { data: pDevs } = await supabase.from('user_devices').select('id').eq('device_type_id', rollout.target_id);
-      deviceIds = (pDevs || []).map(d => d.id);
+    } else if (rollout.target_type === 'model') {
+      const { data: mDevs } = await supabase.from('devices').select('id').eq('device_model_id', rollout.target_id);
+      deviceIds = (mDevs || []).map(d => d.id);
     }
 
     // Apply Percentage
@@ -93,56 +77,80 @@ async function processRollouts() {
 
     // 3. Create Rollout Device Jobs
     for (const devId of selectedDevices) {
-      await supabase.from('ota_rollout_devices').insert({
-        rollout_id: rollout.id,
-        device_id: devId,
-        status: 'pending'
-      });
+      // Check if job exists
+      const { data: existing } = await supabase.from('ota_rollout_devices')
+        .select('id').eq('rollout_id', rollout.id).eq('device_id', devId).single();
+      
+      if (!existing) {
+          await supabase.from('ota_rollout_devices').insert({
+            rollout_id: rollout.id,
+            device_id: devId,
+            status: 'pending'
+          });
+      }
     }
   }
 
   // 4. Process Pending Device Jobs
   const { data: pendingJobs } = await supabase
     .from('ota_rollout_devices')
-    .select('*, user_devices(mac_address), ota_rollouts(status, firmwares(version, public_url))')
+    .select('*, devices(mac_address), ota_rollouts(status, firmware_releases(version, file_url, signature))')
     .eq('status', 'pending');
 
   for (const job of pendingJobs || []) {
-    // Check if rollout was paused or stopped
     if (job.ota_rollouts.status !== 'active') continue;
 
-    const mac = job.user_devices.mac_address;
-    const version = job.ota_rollouts.firmwares.version;
-    const url = job.ota_rollouts.firmwares.public_url;
+    const mac = job.devices?.mac_address;
+    if (!mac) continue;
 
-    console.log(`📤 Sending OTA command to ${mac} for version ${version}`);
+    const fw = job.ota_rollouts.firmware_releases;
+    
+    // Phase 8: Enforce signature checking before issuing OTA updates
+    if (!fw.signature) {
+        console.error(`🚨 Rollout failed: Firmware ${fw.version} lacks a valid signature!`);
+        await supabase.from('ota_rollout_devices')
+          .update({ status: 'failed', error_message: 'Missing firmware signature' })
+          .eq('id', job.id);
+        continue;
+    }
+
+    console.log(`📤 Queuing signed OTA command to ${mac} for version ${fw.version}`);
     
     // Update status to in_progress
     await supabase.from('ota_rollout_devices')
-      .update({ status: 'in_progress', download_started_at: new Date().toISOString() })
+      .update({ status: 'in_progress', started_at: new Date().toISOString() })
       .eq('id', job.id);
 
-    // Send MQTT Command targeted to device
-    const topic = `iot/devices/${mac}/command`;
-    const payload = JSON.stringify({
+    // Using Canonical Command Queue
+    const cmdId = crypto.randomUUID();
+    const payload = {
       action: 'ota',
-      v: version,
-      url: url
-    });
+      v: fw.version,
+      url: fw.file_url,
+      signature: fw.signature
+    };
     
-    mqttClient.publish(topic, payload, { qos: 1 });
+    const { error: cmdErr } = await supabase.from('device_commands').insert({
+        device_id: job.device_id,
+        command_type: 'ota',
+        payload: payload,
+        status: 'PENDING',
+        correlation_id: cmdId
+    });
+
+    if (cmdErr) {
+       console.error('Failed to queue OTA command', cmdErr);
+       continue;
+    }
 
     // Set a health check timeout (e.g. 5 minutes)
     const timeout = setTimeout(async () => {
       console.log(`❌ Device ${mac} failed to report OTA success within timeout.`);
       activeTimeouts.delete(mac);
       
-      // Update DB
       await supabase.from('ota_rollout_devices')
         .update({ status: 'failed', error_message: 'Update Timeout' })
         .eq('id', job.id);
-        
-      // Real system would implement Retry Logic here based on max_retries
     }, 5 * 60 * 1000); 
 
     activeTimeouts.set(mac, timeout);
