@@ -491,19 +491,26 @@ app.delete('/api/admin/users/:id', async (req, res) => {
 });
 
 
-// PROVISIONING: Step 1 - Authorized user sets up the claim
-app.post('/api/devices/provision_setup', async (req, res) => {
-  try {
-    const user = await authenticateUser(req, res);
-    if (!user) return;
+  app.post('/api/devices/provision_setup', async (req, res) => {
+    const reqId = crypto.randomUUID();
+    console.log(`[REQ ${reqId}] POST /api/devices/provision_setup initiated.`);
+    try {
+      const user = await authenticateUser(req, res);
+      if (!user) {
+        console.log(`[REQ ${reqId}] Auth failed.`);
+        return;
+      }
+      console.log(`[REQ ${reqId}] Authenticated user ID: ${user.id}`);
 
-    const { mac_address, session_token } = req.body;
-    if (!mac_address || !session_token) {
-      return res.status(400).json({ success: false, error: 'Missing mac_address or session_token' });
-    }
+      const { mac_address, session_token } = req.body;
+      if (!mac_address || !session_token) {
+        console.log(`[REQ ${reqId}] Missing mac or token. Returning 400.`);
+        return res.status(400).json({ success: false, error: 'Missing mac_address or session_token' });
+      }
+      console.log(`[REQ ${reqId}] Target MAC: ${mac_address}`);
 
-    // Lookup device. Check canonical first, then legacy.
-    let deviceId = null;
+      // Lookup device. Check canonical first, then legacy.
+      let deviceId = null;
     const { data: device } = await supabase.from('devices').select('id').eq('mac_address', mac_address).single();
     if (device) {
        deviceId = device.id;
@@ -516,34 +523,40 @@ app.post('/api/devices/provision_setup', async (req, res) => {
        if (legacyErr || !legacyDevice || legacyDevice.owner_id !== user.id) {
          return res.status(403).json({ success: false, error: 'Forbidden: Device not found or not owned by you' });
        }
-       deviceId = legacyDevice.id; 
-       
-       const { data: map } = await supabase.from('legacy_device_map').select('device_id').eq('legacy_user_device_id', deviceId).single();
-       if (map) deviceId = map.device_id;
-    }
+       const { data: map } = await supabase.from('legacy_device_map').select('device_id').eq('legacy_user_device_id', legacyDevice.id).single();
+       if (map) {
+         deviceId = map.device_id;
+       } else {
+         // The device has not been migrated to the new 'devices' table yet.
+         // We must leave device_id null to prevent a foreign key violation
+         // on device_provisioning_claims.
+         deviceId = null;
+       }
 
     const expires_at = new Date(Date.now() + 10 * 60000).toISOString();
     const tokenHash = crypto.createHash('sha256').update(session_token).digest('hex');
 
-    const { error: claimErr } = await supabase
-      .from('device_provisioning_claims')
-      .insert({
-        mac_address,
-        device_id: deviceId, 
-        claim_token_hash: tokenHash,
-        requested_by: user.id,
-        expires_at
-      });
+      const { error: claimErr, data: claimData } = await supabase
+        .from('device_provisioning_claims')
+        .insert({
+          mac_address,
+          device_id: deviceId, 
+          claim_token_hash: tokenHash,
+          requested_by: user.id,
+          expires_at
+        }).select();
 
-    if (claimErr) throw claimErr;
+      console.log(`[REQ ${reqId}] Claim insertion: result=${claimData ? 'success' : 'null'}, error=${claimErr ? JSON.stringify({code: claimErr.code, msg: claimErr.message, details: claimErr.details, hint: claimErr.hint}) : 'none'}`);
 
-    console.log(`[PROVISION] DB-backed claim setup for ${mac_address} by user ${user.id}`);
-    res.json({ success: true, message: 'Provisioning claim setup successfully' });
-  } catch (err) {
-    console.error('Provision setup error:', err);
-    res.status(500).json({ success: false, error: 'Internal server error' });
-  }
-});
+      if (claimErr) throw claimErr;
+
+      console.log(`[REQ ${reqId}] DB-backed claim setup for ${mac_address} completed. Returning 200.`);
+      res.json({ success: true, message: 'Provisioning claim setup successfully' });
+    } catch (err) {
+      console.error(`[REQ ${reqId}] Provision setup exception:`, err);
+      res.status(500).json({ success: false, error: err.message || 'Internal server error', details: err.details || null });
+    }
+  });
 
 // PROVISIONING: Step 2 - ESP claims its credentials
 app.post('/api/devices/claim', async (req, res) => {

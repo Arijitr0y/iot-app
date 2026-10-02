@@ -29,39 +29,53 @@ X509List certList;
 extern bool relayState;
 extern PubSubClient mqttClient;
 
+#define RELAY_PIN 4 // GPIO4 / D2
+#define BUTTON_PIN 0 // GPIO0 / D3
+#define WIFI_LED_PIN 15 // D8 (GPIO15)
+
 #define FIRMWARE_VERSION "1.0.0"
 
 // --- EEPROM Configuration ---
+const int MAX_SSID_LEN = 32;
+const int MAX_PASS_LEN = 64;
+const int MAX_MQTT_USER_LEN = 64;
+const int MAX_MQTT_PASS_LEN = 128;
+
 const int EEPROM_MAGIC_ADDR = 0;
 const int EEPROM_SSID_ADDR = 1;
-const int EEPROM_PASS_ADDR = 33;
-const int EEPROM_MQTT_USER_ADDR = 130;
-const int EEPROM_MQTT_PASS_ADDR = 165;
-const byte EEPROM_MAGIC_BYTE = 0xAA;
+const int EEPROM_PASS_ADDR = EEPROM_SSID_ADDR + MAX_SSID_LEN + 1;
+const int EEPROM_MQTT_USER_ADDR = EEPROM_PASS_ADDR + MAX_PASS_LEN + 1;
+const int EEPROM_MQTT_PASS_ADDR = EEPROM_MQTT_USER_ADDR + MAX_MQTT_USER_LEN + 1;
+const byte EEPROM_MAGIC_BYTE = 0xAB; // Changed from 0xAA to force re-provisioning on schema change
 
 
-void saveWifiCredentials(String ssid, String password) {
-  // Enforce max lengths
-  if (ssid.length() > 32) ssid = ssid.substring(0, 32);
-  if (password.length() > 64) password = password.substring(0, 64);
+
+bool saveWifiCredentials(String ssid, String password) {
+  // Enforce max lengths without silent truncation
+  if (ssid.length() > MAX_SSID_LEN || password.length() > MAX_PASS_LEN) {
+    Serial.println("Error: Wi-Fi credentials exceed maximum length.");
+    return false;
+  }
   
   // Two-phase commit: invalidate magic byte first
   EEPROM.write(EEPROM_MAGIC_ADDR, 0x00);
   EEPROM.commit();
   
-  for (int i = 0; i < 32; ++i) {
+  for (int i = 0; i <= MAX_SSID_LEN; ++i) {
     if (i < ssid.length()) {
       EEPROM.write(EEPROM_SSID_ADDR + i, ssid[i]);
     } else {
       EEPROM.write(EEPROM_SSID_ADDR + i, 0); // null terminate
+      break;
     }
   }
   
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i <= MAX_PASS_LEN; ++i) {
     if (i < password.length()) {
       EEPROM.write(EEPROM_PASS_ADDR + i, password[i]);
     } else {
       EEPROM.write(EEPROM_PASS_ADDR + i, 0); // null terminate
+      break;
     }
   }
   
@@ -72,6 +86,7 @@ void saveWifiCredentials(String ssid, String password) {
   EEPROM.commit();
   
   Serial.println("Saved Wi-Fi credentials to EEPROM.");
+  return true;
 }
 
 bool loadWifiCredentials(String &ssid, String &password) {
@@ -85,14 +100,14 @@ bool loadWifiCredentials(String &ssid, String &password) {
   }
   
   ssid = "";
-  for (int i = 0; i < 32; ++i) {
+  for (int i = 0; i <= MAX_SSID_LEN; ++i) {
     char c = EEPROM.read(EEPROM_SSID_ADDR + i);
     if (c == 0) break;
     ssid += c;
   }
   
   password = "";
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i <= MAX_PASS_LEN; ++i) {
     char c = EEPROM.read(EEPROM_PASS_ADDR + i);
     if (c == 0) break;
     password += c;
@@ -107,36 +122,39 @@ bool loadWifiCredentials(String &ssid, String &password) {
   return ssid.length() > 0;
 }
 
-void saveMqttCredentials(String user, String password) {
-  if (user.length() > 32) user = user.substring(0, 32);
-  if (password.length() > 64) password = password.substring(0, 64);
-  
-  for (int i = 0; i < 32; ++i) {
-    if (i < user.length()) EEPROM.write(EEPROM_MQTT_USER_ADDR + i, user[i]);
-    else EEPROM.write(EEPROM_MQTT_USER_ADDR + i, 0);
+bool saveMqttCredentials(String user, String password) {
+  if (user.length() > MAX_MQTT_USER_LEN || password.length() > MAX_MQTT_PASS_LEN) {
+    Serial.println("Error: MQTT credentials exceed maximum length.");
+    return false;
   }
   
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i <= MAX_MQTT_USER_LEN; ++i) {
+    if (i < user.length()) EEPROM.write(EEPROM_MQTT_USER_ADDR + i, user[i]);
+    else { EEPROM.write(EEPROM_MQTT_USER_ADDR + i, 0); break; }
+  }
+  
+  for (int i = 0; i <= MAX_MQTT_PASS_LEN; ++i) {
     if (i < password.length()) EEPROM.write(EEPROM_MQTT_PASS_ADDR + i, password[i]);
-    else EEPROM.write(EEPROM_MQTT_PASS_ADDR + i, 0);
+    else { EEPROM.write(EEPROM_MQTT_PASS_ADDR + i, 0); break; }
   }
   
   EEPROM.commit();
   Serial.println("Saved MQTT credentials to EEPROM.");
+  return true;
 }
 
 bool loadMqttCredentials(String &user, String &password) {
   if (EEPROM.read(EEPROM_MAGIC_ADDR) != EEPROM_MAGIC_BYTE) return false;
   
   user = "";
-  for (int i = 0; i < 32; ++i) {
+  for (int i = 0; i <= MAX_MQTT_USER_LEN; ++i) {
     char c = EEPROM.read(EEPROM_MQTT_USER_ADDR + i);
     if (c == 0) break;
     user += c;
   }
   
   password = "";
-  for (int i = 0; i < 64; ++i) {
+  for (int i = 0; i <= MAX_MQTT_PASS_LEN; ++i) {
     char c = EEPROM.read(EEPROM_MQTT_PASS_ADDR + i);
     if (c == 0) break;
     password += c;
@@ -150,9 +168,7 @@ void factoryReset() {
   Serial.println("Starting Factory Reset...");
 
   // Safety: ensure pump relay is OFF before erasing configuration/restarting.
-  // Use the hardware pin directly here because this function is declared
-  // before the later global relay/MQTT objects. The ESP will restart after reset.
-  digitalWrite(2, HIGH); // GPIO2 / D4, active-LOW relay OFF
+  digitalWrite(RELAY_PIN, HIGH); // Active-LOW relay OFF
   
   // 1. Erase EEPROM
   EEPROM.begin(512);
@@ -180,8 +196,7 @@ void initNTP() {
 }
 
 // --- Configuration ---
-const char* AP_SSID_PREFIX = "SmartLight"; 
-const char* AP_PASS = ""; // Leave empty for an open hotspot
+const char* AP_SSID_PREFIX = "SmartLight";
 
 // --- MQTT Configuration (Mosquitto on GCP) ---
 const char* mqtt_server = "mqtt.arijitroy.dpdns.org"; 
@@ -191,11 +206,8 @@ String mqtt_user = "";
 String mqtt_password = "";
 String backend_url = "";
 unsigned long lastClaimPoll = 0;
-
-// Hardware Pins
-const int RELAY_PIN = 4; // GPIO4 / D2
-const int BUTTON_PIN = 0; // GPIO0 / D3
-const int WIFI_LED_PIN = 15; // D8 (GPIO15) - Glows when Wi-Fi is connected
+unsigned long ntpStartTime = 0;
+int ntpRetries = 0;
 
 // Global State
 bool relayState = false;
@@ -279,9 +291,9 @@ void startProvisioningMode() {
   digitalWrite(RELAY_PIN, HIGH);
   if (mqttClient.connected()) mqttClient.disconnect();
 
-  Serial.println("Starting Secure Provisioning Hotspot...");
+  Serial.println("Starting Provisioning Hotspot...");
   WiFi.mode(WIFI_AP_STA);
-  WiFi.softAP(ap_ssid.c_str(), AP_PASS);
+  WiFi.softAP(ap_ssid.c_str());
   
   provState = STATE_PROVISIONING_ACTIVE;
   provisioningStartTime = millis();
@@ -340,15 +352,15 @@ void handleStatus() {
 void handleStartSession() {
   sendCORSHeaders();
   
-  if (provState != STATE_PROVISIONING_ACTIVE) {
+  if (provState != STATE_PROVISIONING_ACTIVE && provState != STATE_PROVISION_FAILED) {
     server.send(403, "application/json", "{\"success\": false, \"error\": \"Device not ready for provisioning or session already claimed\"}");
     return;
   }
   
-  // Generate high-entropy token using ESP8266 hardware RNG
-  uint32_t raw_random = RANDOM_REG32;
-  char tokenBuf[16];
-  snprintf(tokenBuf, sizeof(tokenBuf), "%08x", raw_random);
+  // Generate high-entropy token
+  char tokenBuf[33];
+  snprintf(tokenBuf, sizeof(tokenBuf), "%08x%08x%08x%08x", 
+           RANDOM_REG32, RANDOM_REG32, RANDOM_REG32, RANDOM_REG32);
   provisioningToken = String(tokenBuf);
   wifiConnectStartTime = 0;
   wifiSuccessTime = 0;
@@ -555,7 +567,13 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
       } else if (strcmp(action, "enter_recovery") == 0) {
         Serial.println("Entering Recovery Mode (Mock)...");
         if (cmd_id) sendCommandAck(cmd_id);
+      } else {
+        Serial.println("Unsupported command action.");
+        if (cmd_id) sendCommandAck(cmd_id, "failed");
       }
+    } else {
+      Serial.println("Missing action in command.");
+      if (cmd_id) sendCommandAck(cmd_id, "failed");
     }
     
     if (doc.containsKey("debug")) {
@@ -568,6 +586,9 @@ void mqttCallback(char* topic, byte* payload, unsigned int length) {
     // setRelayState() sets pendingStatePublish = true, which allows the main loop 
     // to debounce the state publish (max once per 250ms). This prevents TLS 
     // buffer overflows if the user spams the on/off button!
+  } else if (String(topic) == mqtt_topic_schedules) {
+    Serial.println("Schedule processing not yet supported in this firmware version.");
+    // Documenting as unsupported per requirements.
   }
 }
 
@@ -909,6 +930,8 @@ void loop() {
       disableAPTime = millis() + 5000;
     } 
     else if (provState == STATE_NTP_SYNCING) {
+      if (ntpStartTime == 0) ntpStartTime = millis();
+      
       if (millis() - lastClaimPoll > 1000) {
         lastClaimPoll = millis();
         time_t now = time(nullptr);
@@ -917,6 +940,17 @@ void loop() {
           Serial.println("Starting cloud claim...");
           provState = STATE_CLOUD_CLAIMING;
           lastClaimPoll = 0; // force immediate claim
+        } else if (millis() - ntpStartTime > 30000) {
+          // Bounded NTP retries
+          ntpRetries++;
+          if (ntpRetries > 3) {
+            Serial.println("Critical error: NTP sync failed after multiple retries.");
+            provState = STATE_PROVISION_FAILED;
+          } else {
+            Serial.println("NTP sync timeout, retrying...");
+            initNTP();
+            ntpStartTime = millis();
+          }
         }
       }
     }
@@ -935,7 +969,7 @@ void loop() {
         
         HTTPClient http;
         WiFiClientSecure client;
-        client.setInsecure(); // Bypass TLS validation for debugging
+        client.setTrustAnchors(&certList); // Use proper root CA validation
         // Timeout in milliseconds (10 seconds)
         client.setTimeout(10000);
         
@@ -969,6 +1003,13 @@ void loop() {
               provState = STATE_MQTT_CONNECTING;
               lastReconnectAttempt = 0;
             }
+          } else if (httpCode == 401) {
+            Serial.println("\nClaim token rejected (401). Entering recoverable failed state.");
+            // Turn AP back on so the user can re-connect and restart provisioning
+            WiFi.mode(WIFI_AP_STA);
+            WiFi.softAP(ap_ssid.c_str());
+            provState = STATE_PROVISION_FAILED;
+            provisioningToken = "";
           }
         } else {
           Serial.printf("\nClaim failed with code: %d\n", httpCode);
