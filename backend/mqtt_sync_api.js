@@ -532,6 +532,7 @@ app.delete('/api/admin/users/:id', async (req, res) => {
          // on device_provisioning_claims.
          deviceId = null;
        }
+    }
 
     const expires_at = new Date(Date.now() + 10 * 60000).toISOString();
     const tokenHash = crypto.createHash('sha256').update(session_token).digest('hex');
